@@ -58,6 +58,228 @@ namespace
 
 namespace yumo
 {
+    // 音频缓冲区大小（约100ms的音频）
+    const size_t AUDIO_CHUNK_SIZE = 44100 * 2 * 2 * 0.1; // 采样率 * 声道 * 字节 * 时长(秒)
+
+    // AudioPool 单例实现
+    AudioPool& AudioPool::getInstance()
+    {
+        static AudioPool instance;
+        return instance;
+    }
+
+    // 添加音频到音频池
+    size_t AudioPool::addAudio(const wchar_t* filename)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        // 加载WAV文件
+        WavInfo wavInfo;
+        loadWav(filename, &wavInfo);
+
+        // 重采样到标准格式
+        StandardWavInfo standardData = convertToStandard(wavInfo);
+
+        // 添加到音频池
+        AudioItem item;
+        item.data = std::move(standardData);
+        item.position = 0;
+        item.volume = 1.0f;
+        item.active = true;
+
+        audioItems_.push_back(std::move(item));
+        return audioItems_.size() - 1;
+    }
+
+    // 获取音频数量
+    size_t AudioPool::getAudioCount() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return audioItems_.size();
+    }
+
+    // 检查指定ID的音频是否正在播放
+    bool AudioPool::isAudioPlaying(size_t audioId) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (audioId >= audioItems_.size())
+            return false;
+        return audioItems_[audioId].position < audioItems_[audioId].data.size();
+    }
+
+    // 混合一小段音频
+    void AudioPool::mixAudioChunk(int16_t* output, size_t chunkSize)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        // 清空输出缓冲区
+        memset(output, 0, chunkSize * sizeof(int16_t));
+
+        // 混合所有激活的音频
+        for (auto& item : audioItems_) {
+            if (!item.active || item.position >= item.data.size())
+                continue;
+
+            size_t remaining = item.data.size() - item.position;
+            size_t samplesToCopy = std::min(chunkSize, remaining);
+
+            for (size_t i = 0; i < samplesToCopy; ++i) {
+                // 应用音量并混合
+                int32_t mixed = static_cast<int32_t>(output[i]) +
+                    static_cast<int32_t>(item.data[item.position + i] * item.volume);
+
+                // 防止溢出
+                if (mixed > INT16_MAX) mixed = INT16_MAX;
+                if (mixed < INT16_MIN) mixed = INT16_MIN;
+
+                output[i] = static_cast<int16_t>(mixed);
+            }
+
+            // 更新播放位置
+            item.position += samplesToCopy;
+        }
+    }
+
+    // 音频播放回调
+    void CALLBACK AudioPool::waveOutCallback(HWAVEOUT hwo, UINT uMsg, DWORD_PTR dwInstance, DWORD_PTR dwParam1, DWORD_PTR dwParam2)
+    {
+        if (uMsg != WOM_DONE)
+            return;
+
+        WAVEHDR* pHeader = reinterpret_cast<WAVEHDR*>(dwParam1);
+        AudioPool* pPool = reinterpret_cast<AudioPool*>(dwInstance);
+
+        if (!pPool || !pHeader)
+            return;
+
+        // 检查是否所有音频都播放完毕
+        bool allFinished = true;
+        {
+            std::lock_guard<std::mutex> lock(pPool->mutex_);
+            for (const auto& item : pPool->audioItems_) {
+                if (item.active && item.position < item.data.size()) {
+                    allFinished = false;
+                    break;
+                }
+            }
+        }
+
+        if (allFinished) {
+            waveOutUnprepareHeader(hwo, pHeader, sizeof(WAVEHDR));
+            delete[] pHeader->lpData;
+            delete pHeader;
+            waveOutClose(hwo);
+            pPool->isPlaying_ = false;
+            return;
+        }
+
+        // 准备新的数据
+        int16_t* pData = new int16_t[AUDIO_CHUNK_SIZE];
+        pPool->mixAudioChunk(pData, AUDIO_CHUNK_SIZE);
+
+        WAVEHDR* pNewHeader = new WAVEHDR;
+        memset(pNewHeader, 0, sizeof(WAVEHDR));
+        pNewHeader->lpData = reinterpret_cast<LPSTR>(pData);
+        pNewHeader->dwBufferLength = static_cast<DWORD>(AUDIO_CHUNK_SIZE * sizeof(int16_t));
+
+        waveOutPrepareHeader(hwo, pNewHeader, sizeof(WAVEHDR));
+        waveOutWrite(hwo, pNewHeader, sizeof(WAVEHDR));
+
+        // 释放旧缓冲区
+        waveOutUnprepareHeader(hwo, pHeader, sizeof(WAVEHDR));
+        delete[] pHeader->lpData;
+        delete pHeader;
+    }
+
+    // 开始播放所有音频（混合播放）
+    void AudioPool::playAll()
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+
+        if (isPlaying_)
+            return;
+
+        if (audioItems_.empty())
+            return;
+
+        // 设置播放格式：44.1kHz, 双声道, 16位
+        WAVEFORMATEX wf = {};
+        wf.wFormatTag = WAVE_FORMAT_PCM;
+        wf.nChannels = 2;
+        wf.nSamplesPerSec = 44100;
+        wf.wBitsPerSample = 16;
+        wf.nBlockAlign = wf.nChannels * wf.wBitsPerSample / 8;
+        wf.nAvgBytesPerSec = wf.nSamplesPerSec * wf.nBlockAlign;
+
+        HWAVEOUT hWaveOut = NULL;
+        
+        // 释放锁后再调用 waveOutOpen（避免回调死锁）
+        lock.unlock();
+        
+        MMRESULT mmResult = waveOutOpen(&hWaveOut, WAVE_MAPPER, &wf, 
+            reinterpret_cast<DWORD_PTR>(waveOutCallback),
+            reinterpret_cast<DWORD_PTR>(this), CALLBACK_FUNCTION);
+
+        if (mmResult != MMSYSERR_NOERROR) {
+            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"波形音频设备打开失败");
+        }
+
+        // 重新锁定
+        lock.lock();
+        isPlaying_ = true;
+
+        // 准备第一个音频块（mixAudioChunk 内部会锁定，所以这里先解锁）
+        lock.unlock();
+        
+        int16_t* pData = new int16_t[AUDIO_CHUNK_SIZE];
+        mixAudioChunk(pData, AUDIO_CHUNK_SIZE);
+
+        WAVEHDR* pHeader = new WAVEHDR;
+        memset(pHeader, 0, sizeof(WAVEHDR));
+        pHeader->lpData = reinterpret_cast<LPSTR>(pData);
+        pHeader->dwBufferLength = static_cast<DWORD>(AUDIO_CHUNK_SIZE * sizeof(int16_t));
+
+        waveOutPrepareHeader(hWaveOut, pHeader, sizeof(WAVEHDR));
+        waveOutWrite(hWaveOut, pHeader, sizeof(WAVEHDR));
+    }
+
+    // 停止播放
+    void AudioPool::stop()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        isPlaying_ = false;
+    }
+
+    // 重置所有音频的播放位置到开头
+    void AudioPool::resetAll()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& item : audioItems_) {
+            item.position = 0;
+        }
+    }
+
+    // 设置音频音量
+    void AudioPool::setVolume(size_t audioId, float volume)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (audioId >= audioItems_.size())
+            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"无效的音频ID");
+        
+        // 限制音量范围
+        audioItems_[audioId].volume = std::max(0.0f, std::min(1.0f, volume));
+    }
+
+    // 获取音频音量
+    float AudioPool::getVolume(size_t audioId) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (audioId >= audioItems_.size())
+            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"无效的音频ID");
+        
+        return audioItems_[audioId].volume;
+    }
+
     // 从磁盘加载WAV文件，解析其格式块和数据块，填充WavInfo结构体
     void loadWav(const wchar_t *filename, WavInfo *out)
     {
