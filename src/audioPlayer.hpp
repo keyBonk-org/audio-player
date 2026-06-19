@@ -37,9 +37,33 @@ namespace yumo
     typedef std::vector<int16_t> StandardWavInfo;
 
     /**
+     * @brief 预加载音频信息结构体
+     * 
+     * 存储重采样后的标准格式音频数据，作为共享数据源
+     * 同一个预加载音频可以被多次添加播放，每次创建独立的播放实例
+     */
+    struct PreloadedAudio {
+        StandardWavInfo data;  // 重采样后的音频数据（44.1kHz, 双声道, 16位）
+    };
+
+    /**
+     * @brief 播放实例结构体
+     * 
+     * 每次 addAudio 创建一个播放实例，追踪独立的播放位置
+     * 多个实例可以引用同一个预加载音频，实现同一音频的重复播放
+     */
+    struct PlayInstance {
+        const PreloadedAudio* source;  // 指向共享的预加载音频数据
+        size_t position;              // 当前播放位置（样本索引）
+        float volume;                // 音量（0.0-1.0）
+        bool active;                 // 是否激活播放
+    };
+
+    /**
      * @brief 音频池类 - 单例模式
      * 
-     * 管理多个音频文件的加载、重采样、播放位置和混合播放
+     * 管理多个音频文件的预加载和混合播放
+     * 支持同一音频的重复播放，每个播放实例独立追踪位置
      */
     class AudioPool
     {
@@ -50,50 +74,78 @@ namespace yumo
         static AudioPool& getInstance();
 
         /**
-         * @brief 添加音频到音频池
+         * @brief 预加载音频文件（异步）
+         * 
+         * 将WAV文件加载并重采样为标准格式，供后续添加播放
+         * 加载在后台线程进行，不阻塞播放
          * 
          * @param filename WAV文件路径
-         * @return 音频ID（用于后续引用）
+         * @param ready 加载状态标记（调用时设为false，加载完成后变为true，使用atomic确保线程同步）
+         * @return 预加载音频ID（用于后续 addAudio）
+         */
+        size_t preloadAudio(const wchar_t* filename, std::atomic<bool>& ready);
+
+        /**
+         * @brief 添加预加载音频到播放池并立即播放
+         * 
+         * 创建一个新的播放实例，与当前播放的音频混合
+         * 
+         * @param preloadedId preloadAudio 返回的预加载音频ID
+         * @return 播放实例ID
+         */
+        size_t addAudio(size_t preloadedId);
+
+        /**
+         * @brief 添加音频文件到播放池并立即播放
+         * 
+         * 简化用法，内部自动完成异步预加载和添加播放
+         * 会等待加载完成后再添加播放
+         * 
+         * @param filename WAV文件路径
+         * @return 播放实例ID
          */
         size_t addAudio(const wchar_t* filename);
 
         /**
-         * @brief 获取音频数量
+         * @brief 获取预加载音频数量
          */
-        size_t getAudioCount() const;
+        size_t getPreloadedCount() const;
 
         /**
-         * @brief 检查指定ID的音频是否正在播放
+         * @brief 获取当前播放实例数量
          */
-        bool isAudioPlaying(size_t audioId) const;
+        size_t getPlayingCount() const;
 
         /**
-         * @brief 开始播放所有音频（混合播放）
+         * @brief 检查指定ID的播放实例是否正在播放
          */
-        void playAll();
+        bool isPlaying(size_t instanceId) const;
 
         /**
-         * @brief 停止播放
+         * @brief 停止所有播放（静音）
+         * 
+         * 重置所有播放实例的位置到开头，并静音
+         * 设备保持打开状态，后续 addAudio 会继续播放
          */
-        void stop();
+        void stopAll();
 
         /**
-         * @brief 重置所有音频的播放位置到开头
+         * @brief 重置所有播放实例的位置到开头
          */
         void resetAll();
 
         /**
-         * @brief 设置音频音量
+         * @brief 设置播放实例音量
          * 
-         * @param audioId 音频ID
+         * @param instanceId 播放实例ID
          * @param volume 音量（0.0-1.0）
          */
-        void setVolume(size_t audioId, float volume);
+        void setVolume(size_t instanceId, float volume);
 
         /**
-         * @brief 获取音频音量
+         * @brief 获取播放实例音量
          */
-        float getVolume(size_t audioId) const;
+        float getVolume(size_t instanceId) const;
 
         // 禁用拷贝构造和赋值
         AudioPool(const AudioPool&) = delete;
@@ -103,27 +155,24 @@ namespace yumo
         AudioPool() = default;
         ~AudioPool() = default;
 
-        // 音频项结构体
-        struct AudioItem {
-            StandardWavInfo data;       // 重采样后的音频数据（44.1kHz, 双声道, 16位）
-            size_t position;            // 当前播放位置（样本索引）
-            float volume;               // 音量（0.0-1.0）
-            bool active;                // 是否激活播放
-        };
-
-        std::vector<AudioItem> audioItems_;  // 音频池
-        mutable std::mutex mutex_;           // 线程安全锁
-        bool isPlaying_ = false;             // 是否正在播放
-        HWAVEOUT hWaveOut_ = nullptr;        // 音频设备句柄
+        std::vector<PreloadedAudio> preloadedAudios_;   // 预加载的音频数据（共享数据源）
+        std::vector<PlayInstance> playInstances_;      // 当前播放的实例（独立位置追踪）
+        mutable std::mutex mutex_;                     // 线程安全锁
+        bool isPlaying_ = false;                        // 是否正在播放
+        bool isMuted_ = false;                         // 是否静音
+        HWAVEOUT hWaveOut_ = nullptr;                  // 音频设备句柄
 
         // 双缓冲常量
-        static const size_t BUFFER_COUNT = 2; // 缓冲区数量
+        static const size_t BUFFER_COUNT = 2;           // 缓冲区数量
 
         // 混合音频回调函数
         static void CALLBACK waveOutCallback(HWAVEOUT hwo, UINT uMsg, DWORD_PTR dwInstance, DWORD_PTR dwParam1, DWORD_PTR dwParam2);
         
         // 混合一小段音频
         void mixAudioChunk(int16_t* output, size_t chunkSize);
+
+        // 准备音频设备
+        void ensureDeviceOpen();
     };
 
     /**

@@ -6,6 +6,8 @@
 #include "yumo_except.hpp"
 #include <cassert>
 #include <functional>
+#include <thread>
+#include <atomic>
 
 namespace
 {
@@ -69,43 +71,141 @@ namespace yumo
         return instance;
     }
 
-    // 添加音频到音频池
+    // 预加载音频文件（异步）
+    size_t AudioPool::preloadAudio(const wchar_t* filename, std::atomic<bool>& ready)
+    {
+        // 标记加载状态为未完成
+        ready = false;
+
+        // 预留一个位置，获取 ID
+        size_t preloadedId;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            preloadedAudios_.push_back(PreloadedAudio());  // 预留空位置
+            preloadedId = preloadedAudios_.size() - 1;
+        }
+
+        // 创建后台加载线程
+        std::thread loadThread([this, filename, preloadedId, &ready]() {
+            try {
+                // 加载WAV文件（不持有锁，避免阻塞播放）
+                WavInfo wavInfo;
+                loadWav(filename, &wavInfo);
+
+                // 重采样到标准格式
+                StandardWavInfo standardData = convertToStandard(wavInfo);
+
+                // 填充预留的位置
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    preloadedAudios_[preloadedId].data = std::move(standardData);
+                }
+
+                // 标记加载完成（atomic 确保线程同步）
+                ready = true;
+            } catch (...) {
+                // 加载失败，标记完成（但数据为空）
+                ready = true;
+            }
+        });
+
+        // 分离线程，让它在后台运行
+        loadThread.detach();
+
+        return preloadedId;
+    }
+
+    // 添加预加载音频并立即播放
+    size_t AudioPool::addAudio(size_t preloadedId)
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+
+        if (preloadedId >= preloadedAudios_.size())
+            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"无效的预加载音频ID");
+
+        // 检查数据是否已加载
+        if (preloadedAudios_[preloadedId].data.empty())
+            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"预加载音频数据为空");
+
+        // 创建播放实例
+        PlayInstance instance;
+        instance.source = &preloadedAudios_[preloadedId];
+        instance.position = 0;
+        instance.volume = 1.0f;
+        instance.active = true;
+
+        playInstances_.push_back(instance);
+        size_t instanceId = playInstances_.size() - 1;
+
+        // 如果设备未打开，则打开
+        if (!hWaveOut_) {
+            lock.unlock();
+            ensureDeviceOpen();
+        } else {
+            // 取消静音
+            isMuted_ = false;
+        }
+
+        return instanceId;
+    }
+
+    // 添加音频文件并立即播放（简化用法）
     size_t AudioPool::addAudio(const wchar_t* filename)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-
-        // 加载WAV文件
-        WavInfo wavInfo;
-        loadWav(filename, &wavInfo);
-
-        // 重采样到标准格式
-        StandardWavInfo standardData = convertToStandard(wavInfo);
-
-        // 添加到音频池
-        AudioItem item;
-        item.data = std::move(standardData);
-        item.position = 0;
-        item.volume = 1.0f;
-        item.active = true;
-
-        audioItems_.push_back(std::move(item));
-        return audioItems_.size() - 1;
+        // 使用智能指针确保 ready 的生命周期覆盖后台线程
+        auto ready = std::make_shared<std::atomic<bool>>(false);
+        size_t preloadedId = preloadAudio(filename, *ready);
+        
+        // 在后台线程等待加载完成并播放
+        std::thread([this, preloadedId, ready]() {
+            // 等待加载完成
+            while (!ready->load()) {
+                Sleep(10);
+            }
+            
+            // 加载完成后检查数据是否有效
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (preloadedId >= preloadedAudios_.size() || preloadedAudios_[preloadedId].data.empty()) {
+                    // 加载失败
+                    return;
+                }
+            }
+            
+            // 添加播放
+            try {
+                addAudio(preloadedId);
+            } catch (...) {
+                // 忽略播放失败
+            }
+        }).detach();
+        
+        // 返回预加载ID作为标识（用户可用于后续控制）
+        return preloadedId;
     }
 
-    // 获取音频数量
-    size_t AudioPool::getAudioCount() const
+    // 获取预加载音频数量
+    size_t AudioPool::getPreloadedCount() const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        return audioItems_.size();
+        return preloadedAudios_.size();
     }
 
-    // 检查指定ID的音频是否正在播放
-    bool AudioPool::isAudioPlaying(size_t audioId) const
+    // 获取当前播放实例数量
+    size_t AudioPool::getPlayingCount() const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (audioId >= audioItems_.size())
+        return playInstances_.size();
+    }
+
+    // 检查播放实例是否正在播放
+    bool AudioPool::isPlaying(size_t instanceId) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (instanceId >= playInstances_.size())
             return false;
-        return audioItems_[audioId].position < audioItems_[audioId].data.size();
+        const auto& inst = playInstances_[instanceId];
+        return inst.active && inst.source && inst.position < inst.source->data.size();
     }
 
     // 混合一小段音频
@@ -113,21 +213,28 @@ namespace yumo
     {
         std::lock_guard<std::mutex> lock(mutex_);
 
+        // 如果静音，输出静默
+        if (isMuted_) {
+            memset(output, 0, chunkSize * sizeof(int16_t));
+            return;
+        }
+
         // 清空输出缓冲区
         memset(output, 0, chunkSize * sizeof(int16_t));
 
-        // 混合所有激活的音频
-        for (auto& item : audioItems_) {
-            if (!item.active || item.position >= item.data.size())
+        // 混合所有激活的播放实例
+        for (auto& inst : playInstances_) {
+            if (!inst.active || !inst.source || inst.position >= inst.source->data.size())
                 continue;
 
-            size_t remaining = item.data.size() - item.position;
+            const auto& data = inst.source->data;
+            size_t remaining = data.size() - inst.position;
             size_t samplesToCopy = std::min(chunkSize, remaining);
 
             for (size_t i = 0; i < samplesToCopy; ++i) {
                 // 应用音量并混合
                 int32_t mixed = static_cast<int32_t>(output[i]) +
-                    static_cast<int32_t>(item.data[item.position + i] * item.volume);
+                    static_cast<int32_t>(data[inst.position + i] * inst.volume);
 
                 // 防止溢出
                 if (mixed > INT16_MAX) mixed = INT16_MAX;
@@ -137,7 +244,7 @@ namespace yumo
             }
 
             // 更新播放位置
-            item.position += samplesToCopy;
+            inst.position += samplesToCopy;
         }
     }
 
@@ -165,8 +272,9 @@ namespace yumo
             if (!pPool->isPlaying_) {
                 return; // 已停止播放
             }
-            for (const auto& item : pPool->audioItems_) {
-                if (item.active && item.position < item.data.size()) {
+            // 如果有激活的实例还没播完，就继续
+            for (const auto& inst : pPool->playInstances_) {
+                if (inst.active && inst.source && inst.position < inst.source->data.size()) {
                     allFinished = false;
                     break;
                 }
@@ -195,20 +303,20 @@ namespace yumo
         waveOutWrite(hwo, pNewHeader, sizeof(WAVEHDR));
     }
 
-    // 开始播放所有音频（混合播放）
-    void AudioPool::playAll()
+    // 确保音频设备已打开
+    void AudioPool::ensureDeviceOpen()
     {
         std::unique_lock<std::mutex> lock(mutex_);
 
-        if (isPlaying_)
+        if (hWaveOut_)
             return;
 
-        if (audioItems_.empty())
+        if (playInstances_.empty())
             return;
 
-        // 重置播放位置
-        for (auto& item : audioItems_) {
-            item.position = 0;
+        // 重置所有播放位置
+        for (auto& inst : playInstances_) {
+            inst.position = 0;
         }
 
         // 设置播放格式：44.1kHz, 双声道, 16位
@@ -222,7 +330,6 @@ namespace yumo
 
         HWAVEOUT hWaveOut = NULL;
         
-        // 释放锁后再调用 waveOutOpen（避免回调死锁）
         lock.unlock();
         
         MMRESULT mmResult = waveOutOpen(&hWaveOut, WAVE_MAPPER, &wf, 
@@ -233,10 +340,10 @@ namespace yumo
             throw yumo::exception_ex(yumo::exception::type::UnknownError, L"波形音频设备打开失败");
         }
 
-        // 保存设备句柄
         lock.lock();
         hWaveOut_ = hWaveOut;
         isPlaying_ = true;
+        isMuted_ = false;
         lock.unlock();
 
         // 预先准备多个缓冲区（双缓冲）
@@ -254,50 +361,48 @@ namespace yumo
         }
     }
 
-    // 停止播放
-    void AudioPool::stop()
+    // 停止所有播放（静音）
+    void AudioPool::stopAll()
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!isPlaying_)
-            return;
         
-        isPlaying_ = false;
-        
-        if (hWaveOut_) {
-            waveOutReset(hWaveOut_);  // 停止播放并标记所有缓冲区为已完成
-            waveOutClose(hWaveOut_);
-            hWaveOut_ = nullptr;
+        // 重置所有播放实例的位置
+        for (auto& inst : playInstances_) {
+            inst.position = 0;
+            inst.active = false;
         }
+        
+        // 设置静音标志
+        isMuted_ = true;
     }
 
-    // 重置所有音频的播放位置到开头
+    // 重置所有播放实例的位置到开头
     void AudioPool::resetAll()
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& item : audioItems_) {
-            item.position = 0;
+        for (auto& inst : playInstances_) {
+            inst.position = 0;
         }
     }
 
-    // 设置音频音量
-    void AudioPool::setVolume(size_t audioId, float volume)
+    // 设置播放实例音量
+    void AudioPool::setVolume(size_t instanceId, float volume)
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (audioId >= audioItems_.size())
-            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"无效的音频ID");
+        if (instanceId >= playInstances_.size())
+            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"无效的播放实例ID");
         
-        // 限制音量范围
-        audioItems_[audioId].volume = std::max(0.0f, std::min(1.0f, volume));
+        playInstances_[instanceId].volume = std::max(0.0f, std::min(1.0f, volume));
     }
 
-    // 获取音频音量
-    float AudioPool::getVolume(size_t audioId) const
+    // 获取播放实例音量
+    float AudioPool::getVolume(size_t instanceId) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (audioId >= audioItems_.size())
-            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"无效的音频ID");
+        if (instanceId >= playInstances_.size())
+            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"无效的播放实例ID");
         
-        return audioItems_[audioId].volume;
+        return playInstances_[instanceId].volume;
     }
 
     // 从磁盘加载WAV文件，解析其格式块和数据块，填充WavInfo结构体

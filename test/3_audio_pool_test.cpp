@@ -3,6 +3,7 @@
 #include <iostream>
 #include <io.h>
 #include <fcntl.h>
+#include <atomic>
 
 int main()
 {
@@ -11,46 +12,51 @@ int main()
     _setmode(_fileno(stdin), _O_U16TEXT);
     #endif
     
-    std::wcout << L"=== Yumo Audio 音频池混合测试 ===" << std::endl;
+    std::wcout << L"=== Yumo Audio addAudio 字符串版本测试 ===" << std::endl;
+    
+    // 打印当前工作目录
+    wchar_t cwd[MAX_PATH];
+    GetCurrentDirectoryW(MAX_PATH, cwd);
+    std::wcout << L"当前工作目录: " << cwd << std::endl;
     
     try {
         // 获取音频池单例
         yumo::AudioPool& pool = yumo::AudioPool::getInstance();
         
-        // 添加音频文件到音频池
+        // 使用绝对路径测试
         const wchar_t* files[] = {
-            L"../audio/test.wav",
-            L"../audio/test2.wav", 
-            L"../audio/test3.wav"
+            L"c:\\小狄\\audio-player\\test\\audio\\test.wav",
+            L"c:\\小狄\\audio-player\\test\\audio\\test2.wav", 
+            L"c:\\小狄\\audio-player\\test\\audio\\test3.wav"
         };
         
-        std::wcout << L"\n正在加载音频文件..." << std::endl;
+        std::wcout << L"\n使用 addAudio(filename) 字符串版本（异步加载，立即返回）..." << std::endl;
         for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); ++i) {
-            std::wcout << L"添加音频: " << files[i] << std::endl;
-            size_t audioId = pool.addAudio(files[i]);
-            std::wcout << L"  -> 音频ID: " << audioId << std::endl;
-            
-            // 设置不同音量（测试混合效果）
-            float volume = 0.5f + (i * 0.2f);
-            if (volume > 1.0f) volume = 1.0f;
-            pool.setVolume(audioId, volume);
-            std::wcout << L"  -> 音量设置: " << volume << std::endl;
+            std::wcout << L"\n添加音频: " << files[i] << std::endl;
+            // 立即返回，加载和播放都在后台完成
+            size_t preloadedId = pool.addAudio(files[i]);  
+            std::wcout << L"  -> 预加载ID: " << preloadedId << L" (立即返回，后台加载播放)" << std::endl;
+            std::wcout << L"  -> 当前预加载数: " << pool.getPreloadedCount() << std::endl;
         }
         
-        std::wcout << L"\n音频池中共计 " << pool.getAudioCount() << L" 个音频" << std::endl;
+        std::wcout << L"\n所有音频已提交加载！" << std::endl;
+        std::wcout << L"预加载音频数: " << pool.getPreloadedCount() << std::endl;
         
-        // 开始混合播放
-        std::wcout << L"\n按 Enter 键开始混合播放..." << std::endl;
+        // 等待所有音频加载并开始播放
+        std::wcout << L"\n等待音频开始播放...(5秒)" << std::endl;
+        for (int i = 0; i < 5; ++i) {
+            Sleep(1000);
+            std::wcout << L"  已等待 " << (i+1) << L" 秒，播放实例数: " << pool.getPlayingCount() << std::endl;
+        }
+        
+        std::wcout << L"\n播放实例数: " << pool.getPlayingCount() << std::endl;
+        
+        // 等待用户输入停止
+        std::wcout << L"\n按 Enter 键停止" << std::endl;
         std::wcin.get();
         
-        std::wcout << L"正在混合播放所有音频..." << std::endl;
-        pool.playAll();
-        
-        // 等待播放结束（播放是异步的，这里简单等待）
-        std::wcout << L"播放中...按 Enter 键退出" << std::endl;
-        std::wcin.get();
-        
-        pool.stop();
+        pool.stopAll();
+        std::wcout << L"已停止所有播放" << std::endl;
         
     } catch (const yumo::exception_ex& e) {
         std::wcout << L"发生异常: " << e.what() << std::endl;
