@@ -25,9 +25,9 @@ int main()
         
         // 使用绝对路径测试
         const wchar_t* files[] = {
-            L"c:\\小狄\\audio-player\\test\\audio\\test.wav",
-            L"c:\\小狄\\audio-player\\test\\audio\\test2.wav", 
-            L"c:\\小狄\\audio-player\\test\\audio\\test3.wav"
+            L"..\\audio\\test.wav",
+            L"..\\audio\\test2.wav", 
+            L"..\\audio\\test3.wav"
         };
         
         std::wcout << L"\n使用 addAudio(filename) 字符串版本（异步加载，立即返回）..." << std::endl;
