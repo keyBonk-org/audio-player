@@ -559,7 +559,7 @@ namespace yumo
         out->valid = true; // 标记结构体有效
     }
 
-    // 使用 libsamplerate 进行音频转换
+    // 使用 Windows ACM 进行音频转换
     StandardWavInfo convertToStandard(const WavInfo &wavInfo)
     {
         // 检查WAV文件是否有效
@@ -570,98 +570,105 @@ namespace yumo
 
         const int sourceSampleRate = wavInfo.wf.nSamplesPerSec;
         const int sourceChannels = wavInfo.wf.nChannels;
+        const int sourceBitsPerSample = wavInfo.wf.wBitsPerSample;
         const int targetSampleRate = 44100;
         const int targetChannels = 2; // 双声道
+        const int targetBitsPerSample = 16;
 
-        // 计算每个样本的字节数和总帧数
-        const size_t bytesPerSample = wavInfo.wf.wBitsPerSample / 8;
-        const size_t totalFrames = wavInfo.dataSize / (bytesPerSample * sourceChannels);
+        // 步骤1：设置源格式
+        WAVEFORMATEX sourceFormat = {};
+        sourceFormat.wFormatTag = WAVE_FORMAT_PCM;
+        sourceFormat.nChannels = static_cast<WORD>(sourceChannels);
+        sourceFormat.nSamplesPerSec = sourceSampleRate;
+        sourceFormat.wBitsPerSample = sourceBitsPerSample;
+        sourceFormat.nBlockAlign = sourceFormat.nChannels * sourceFormat.wBitsPerSample / 8;
+        sourceFormat.nAvgBytesPerSec = sourceFormat.nSamplesPerSec * sourceFormat.nBlockAlign;
+        sourceFormat.cbSize = 0;
 
-        // 步骤1：将原始数据转换为 float 格式（多声道交织）
-        std::vector<float> inputFrames;
-        inputFrames.reserve(totalFrames * sourceChannels);
+        // 步骤2：设置目标格式
+        WAVEFORMATEX targetFormat = {};
+        targetFormat.wFormatTag = WAVE_FORMAT_PCM;
+        targetFormat.nChannels = static_cast<WORD>(targetChannels);
+        targetFormat.nSamplesPerSec = targetSampleRate;
+        targetFormat.wBitsPerSample = targetBitsPerSample;
+        targetFormat.nBlockAlign = targetFormat.nChannels * targetFormat.wBitsPerSample / 8;
+        targetFormat.nAvgBytesPerSec = targetFormat.nSamplesPerSec * targetFormat.nBlockAlign;
+        targetFormat.cbSize = 0;
 
-        for (size_t i = 0; i < totalFrames * sourceChannels; ++i) {
-            const char* samplePtr = wavInfo.pcmData.get() + (i * bytesPerSample);
-            float normalizedValue = 0.0f;
+        // 步骤3：打开ACM流
+        HACMSTREAM hAcmStream = nullptr;
+        MMRESULT mmResult = acmStreamOpen(
+            &hAcmStream,
+            NULL,                   // 自动选择驱动程序
+            &sourceFormat,          // 源格式
+            &targetFormat,          // 目标格式
+            NULL,                   // 无滤波器
+            0,                      // 回调（同步模式）
+            0,                      // 实例数据
+            0                       // 同步操作
+        );
 
-            switch (wavInfo.wf.wBitsPerSample) {
-                case 8: {
-                    uint8_t sample = *reinterpret_cast<const uint8_t*>(samplePtr);
-                    normalizedValue = (sample / 128.0f) - 1.0f;
-                    break;
-                }
-                case 16: {
-                    int16_t sample = *reinterpret_cast<const int16_t*>(samplePtr);
-                    normalizedValue = sample / 32768.0f;
-                    break;
-                }
-                case 24: {
-                    int32_t sample = (
-                        (static_cast<uint8_t>(samplePtr[0]) << 0) |
-                        (static_cast<uint8_t>(samplePtr[1]) << 8) |
-                        (static_cast<uint8_t>(samplePtr[2]) << 16)
-                    );
-                    if (sample & 0x800000) {
-                        sample |= 0xFF000000;
-                    }
-                    normalizedValue = sample / 8388608.0f;
-                    break;
-                }
-                case 32: {
-                    int32_t sample = *reinterpret_cast<const int32_t*>(samplePtr);
-                    normalizedValue = sample / 2147483648.0f;
-                    break;
-                }
-                default:
-                    throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"不支持的位深度");
-            }
-            inputFrames.push_back(normalizedValue);
+        if (mmResult != MMSYSERR_NOERROR) {
+            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"ACM流打开失败");
         }
 
-        // 步骤2：使用 libsamplerate 进行重采样
-        const double ratio = static_cast<double>(targetSampleRate) / sourceSampleRate;
-        const size_t outputFramesEstimate = static_cast<size_t>(totalFrames * ratio) + 1;
-        
-        std::vector<float> resampledFrames(outputFramesEstimate * sourceChannels);
-
-        SRC_DATA srcData;
-        srcData.data_in = inputFrames.data();
-        srcData.data_out = resampledFrames.data();
-        srcData.input_frames = static_cast<long>(totalFrames);
-        srcData.output_frames = static_cast<long>(outputFramesEstimate);
-        srcData.src_ratio = ratio;
-        srcData.end_of_input = 1;
-
-        int error = src_simple(&srcData, SRC_SINC_MEDIUM_QUALITY, sourceChannels);
-        if (error != 0) {
-            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"重采样失败");
+        // 步骤4：计算目标缓冲区大小
+        DWORD sourceSize = wavInfo.dataSize;
+        DWORD destSize = 0;
+        mmResult = acmStreamSize(hAcmStream, sourceSize, &destSize, ACM_STREAMSIZEF_SOURCE);
+        if (mmResult != MMSYSERR_NOERROR) {
+            acmStreamClose(hAcmStream, 0);
+            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"无法计算目标缓冲区大小");
         }
 
-        resampledFrames.resize(srcData.output_frames_gen * sourceChannels);
+        // 步骤5：准备转换头
+        std::unique_ptr<uint8_t[]> sourceBuffer(new uint8_t[sourceSize]);
+        std::unique_ptr<uint8_t[]> destBuffer(new uint8_t[destSize]);
 
-        // 步骤3：转换为双声道
-        std::vector<float> stereoFrames;
-        stereoFrames.reserve(srcData.output_frames_gen * targetChannels);
+        ACMSTREAMHEADER streamHeader = {};
+        streamHeader.cbStruct = sizeof(ACMSTREAMHEADER);
+        streamHeader.pbSrc = sourceBuffer.get();
+        streamHeader.cbSrcLength = sourceSize;
+        streamHeader.pbDst = destBuffer.get();
+        streamHeader.cbDstLength = destSize;
 
-        if (sourceChannels == 1) {
-            // 单声道转双声道：复制到两个声道
-            const long outputFrames = srcData.output_frames_gen;
-            for (long i = 0; i < outputFrames; ++i) {
-                float sample = resampledFrames[i];
-                stereoFrames.push_back(sample);
-                stereoFrames.push_back(sample);
-            }
-        } else if (sourceChannels == 2) {
-            stereoFrames = std::move(resampledFrames);
-        } else {
-            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"不支持超过2个声道");
+        mmResult = acmStreamPrepareHeader(hAcmStream, &streamHeader, 0);
+        if (mmResult != MMSYSERR_NOERROR) {
+            acmStreamClose(hAcmStream, 0);
+            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"ACM头准备失败");
         }
 
-        // 步骤4：转换为 int16_t
+        // 步骤6：复制源数据
+        memcpy(sourceBuffer.get(), wavInfo.pcmData.get(), sourceSize);
+
+        // 步骤7：执行转换
+        streamHeader.cbSrcLength = sourceSize;
+        streamHeader.cbDstLengthUsed = 0;
+        mmResult = acmStreamConvert(hAcmStream, &streamHeader, ACM_STREAMCONVERTF_BLOCKALIGN);
+        if (mmResult != MMSYSERR_NOERROR) {
+            acmStreamUnprepareHeader(hAcmStream, &streamHeader, 0);
+            acmStreamClose(hAcmStream, 0);
+            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"音频转换失败");
+        }
+
+        // 步骤8：清理ACM资源
+        mmResult = acmStreamUnprepareHeader(hAcmStream, &streamHeader, 0);
+        if (mmResult != MMSYSERR_NOERROR) {
+            acmStreamClose(hAcmStream, 0);
+            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"ACM头清理失败");
+        }
+
+        mmResult = acmStreamClose(hAcmStream, 0);
+        if (mmResult != MMSYSERR_NOERROR) {
+            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"ACM流关闭失败");
+        }
+
+        // 步骤9：将转换后的数据转换为 StandardWavInfo (int16_t 双声道交织)
+        const size_t outputBytes = streamHeader.cbDstLengthUsed;
+        const size_t outputSamples = outputBytes / sizeof(int16_t);
         StandardWavInfo result;
-        result.resize(stereoFrames.size());
-        src_float_to_short_array(stereoFrames.data(), result.data(), static_cast<int>(stereoFrames.size()));
+        result.resize(outputSamples);
+        memcpy(result.data(), destBuffer.get(), outputBytes);
 
         return result;
     }

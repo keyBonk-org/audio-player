@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <mmreg.h>
+#include <msacm.h>
 #include <stdio.h>
 #include <memory>
 #include <vector>
@@ -7,9 +8,6 @@
 #include <algorithm>
 #include <map>
 #include <mutex>
-
-// libsamplerate 库
-#include "libsamplerate/include/samplerate.h"
 
 namespace yumo
 {

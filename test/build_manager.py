@@ -86,16 +86,14 @@ def compile_file(src_path, exe_name=None):
     # 构建包含目录
     include_dirs = [
         SCRIPT_DIR,
-        SRC_DIR,
-        os.path.join(SRC_DIR, "libsamplerate", "include")
+        SRC_DIR
     ]
     include_args = []
     for inc_dir in include_dirs:
         include_args.extend(["-I", inc_dir])
 
-    # 库目录和链接库
-    lib_dir = os.path.join(SRC_DIR, "libsamplerate", "lib")
-    link_args = ["-L", lib_dir, "-lsamplerate", "-lwinmm", "-lcomdlg32"]
+    # 链接库 (Windows ACM)
+    link_args = ["-lmsacm32", "-lwinmm", "-lcomdlg32"]
 
     cmd = ["g++", "-std=c++17", "-o", exe_path] + src_files + include_args + link_args
 

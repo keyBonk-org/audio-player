@@ -19,14 +19,15 @@
 
 ## 依赖库
 
-| 库 | 路径 | 说明 |
-|----|------|------|
-| libsamplerate | `src/libsamplerate` | 音频重采样库 |
+| 库 | 说明 |
+|----|------|
+| Windows ACM | 系统自带音频转换库（msacm32.lib） |
+| winmm | Windows 多媒体 API |
 
 ### 编译命令
 
 ```powershell
-g++ -std=c++17 -I"src" -I"src/libsamplerate/include" -o output.exe source.cpp src/audioPlayer.cpp -L"src/libsamplerate/lib" -lsamplerate -lwinmm
+g++ -std=c++17 -I"src" -o output.exe source.cpp src/audioPlayer.cpp -lmsacm32 -lwinmm -lcomdlg32
 ```
 
 ### 编译中间产物
@@ -35,31 +36,13 @@ g++ -std=c++17 -I"src" -I"src/libsamplerate/include" -o output.exe source.cpp sr
 
 | 文件类型 | 存放路径 | 说明 |
 |----------|----------|------|
-| `.def` 导出定义文件 | `src/libsamplerate/lib/` | 从 DLL 提取导出符号 |
-| `.a` MinGW 导入库 | `src/libsamplerate/lib/` | MinGW/G++ 链接用 |
 | `.exe` 测试可执行文件 | `test/compiled/` | 测试程序输出 |
-| `.dll` 运行时依赖 | `test/compiled/` | 测试运行时需要的 DLL ，注意复制前请先检测一下`test/compiled/`下是否已经存在，已经存在的话之后都不再复制 |
 
 **不要将中间产物放在项目根目录**，以免污染源码仓库。
-
-#### MinGW 导入库生成（首次编译）
-
-如果 libsamplerate 只提供了 MSVC 格式的 `.lib` 文件，需要为 MinGW 生成兼容的导入库：
-
-```powershell
-# 1. 从 DLL 生成导出定义文件
-cd src/libsamplerate/bin
-gendef samplerate.dll
-
-# 2. 从 .def 生成 MinGW 导入库
-dlltool -d samplerate.def -D samplerate.dll -l ../lib/libsamplerate_mingw.a
-```
 
 ### 测试文件编译
 
 测试文件编译至：`./test/compiled/`
-
-文件夹已包含依赖库的 DLL 文件，测试时无需额外复制。
 
 ## API 接口
 
@@ -71,7 +54,8 @@ dlltool -d samplerate.def -D samplerate.dll -l ../lib/libsamplerate_mingw.a
 | `preloadAudio(filename, ready)` | 异步预加载音频文件 |
 | `addAudio(preloadedId)` | 添加预加载音频并立即播放 |
 | `addAudio(filename)` | 简化用法：异步加载并播放 |
-| `stopAll()` | 静音所有播放 |
+| `stopAll()` | 停止所有播放（挂起） |
+| `resume()` | 恢复播放 |
 
 ### 查询接口
 
@@ -86,6 +70,8 @@ dlltool -d samplerate.def -D samplerate.dll -l ../lib/libsamplerate_mingw.a
 | 接口 | 说明 |
 |------|------|
 | `setVolume(instanceId, volume)` | 设置播放实例音量 |
+| `setMuted(muted)` | 设置全局静音状态 |
+| `resetAll()` | 重置所有播放实例位置到开头 |
 
 ## 数据结构
 
@@ -105,10 +91,10 @@ struct PreloadedAudio {
 
 ```cpp
 struct PlayInstance {
-    const PreloadedAudio* source;  // 指向共享的预加载音频数据
-    size_t position;              // 当前播放位置（样本索引）
-    float volume;                // 音量（0.0-1.0）
-    bool active;                 // 是否激活播放
+    PreloadedAudio* source;  // 指向共享的预加载音频数据
+    size_t position;         // 当前播放位置（样本索引）
+    float volume;            // 音量（0.0-1.0）
+    bool active;             // 是否激活播放
 };
 ```
 
@@ -140,14 +126,25 @@ struct PlayInstance {
 `preloadAudio` 使用后台线程异步加载，不阻塞音频播放：
 
 1. 主线程预留位置并返回 ID
-2. 后台线程加载 WAV 文件并重采样
+2. 后台线程加载 WAV 文件并使用 Windows ACM 重采样
 3. 通过 `std::atomic<bool>` 标记加载完成状态
 4. `addAudio(preloadedId)` 检查数据就绪后创建播放实例
+
+### Windows ACM 重采样
+
+使用 Windows ACM API 进行音频格式转换：
+
+1. `acmStreamOpen` - 打开转换流
+2. `acmStreamSize` - 计算目标缓冲区大小
+3. `acmStreamPrepareHeader` - 准备转换头
+4. `acmStreamConvert` - 执行转换
+5. `acmStreamClose` - 关闭转换流
 
 ### 线程安全
 
 - 使用 `std::mutex` 保护共享数据
 - `std::atomic<bool>` 用于跨线程状态同步
+- 使用 `std::unique_ptr` 管理动态分配的预加载音频数据，避免 vector 扩容导致的悬空指针
 - 所有公开接口都是线程安全的
 
 ## 使用示例
@@ -176,22 +173,29 @@ pool.setVolume(instanceId, 0.5f);
 
 // 停止
 pool.stopAll();
+
+// 恢复
+pool.resume();
 ```
 
 ## 注意事项
 
 1. **路径问题**：使用相对路径时注意工作目录，测试程序从 `test/compiled/` 运行
 2. **音频播放完毕**：播放实例不会自动清理，需手动 `stopAll()`
-3. **设备状态**：`stopAll()` 不会关闭音频设备，只是静音并重置位置
+3. **设备状态**：`stopAll()` 不会关闭音频设备，只是停止并重置位置
 4. **内存管理**：音频数据由库管理，调用者无需释放
+5. **停止与恢复**：`stopAll()` 后需要调用 `resume()` 才能重新播放
 
 ## 测试文件
 
 | 文件 | 说明 |
 |------|------|
+| `test/1_readAudioInfo.cpp` | WAV 文件信息读取测试 |
+| `test/2_resample_test.cpp` | 音频重采样测试 |
 | `test/3_audio_pool_test.cpp` | addAudio 字符串版本测试 |
 | `test/4_audio_mix_test.cpp` | 预加载 + 延迟添加测试 |
 | `test/5_simple_test.cpp` | 单音频播放测试 |
+| `test/6_play_control_test.cpp` | 播放控制测试 |
 
 ## 文件结构
 
@@ -199,15 +203,30 @@ pool.stopAll();
 audio-player/
 ├── src/
 │   ├── audioPlayer.hpp    # 头文件
-│   ├── audioPlayer.cpp    # 实现
-│   └── libsamplerate/    # 重采样库
+│   └── audioPlayer.cpp    # 实现
 ├── test/
 │   ├── audio/             # 测试音频文件
 │   ├── compiled/          # 编译输出目录
+│   ├── build_manager.py   # 编译管理脚本
 │   └── *.cpp              # 测试源文件
+├── README.md              # 项目说明
 └── agent.md               # 本文档
 ```
+
 ## AI开发须知
 
-每次修改完库源码，编译对应的测试文件到compile路径下，以便用户检测，本要求在库提供一个建议的测试文件编译方案前永久生效
+每次修改完库源码，编译对应的测试文件到 compile 路径下，以便用户检测，本要求在库提供一个建议的测试文件编译方案前永久生效
 
+### 编译管理脚本
+
+使用 `build_manager.py` 脚本编译测试文件：
+
+```powershell
+cd test
+python build_manager.py
+```
+
+脚本支持：
+- 按序号选择编译文件（如 `1 3 4-6`）
+- `all` 选项编译全部测试文件
+- 自动输出到 `test/compiled/` 目录
