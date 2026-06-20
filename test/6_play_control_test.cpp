@@ -27,9 +27,9 @@ int main()
         
         // 测试音频路径（请替换为实际的长音频文件）
         const wchar_t* files[] = {
-            L"c:\\小狄\\audio-player\\test\\audio\\test.wav",
-            L"c:\\小狄\\audio-player\\test\\audio\\test2.wav",
-            L"c:\\小狄\\audio-player\\test\\audio\\test3.wav"
+            L"..\\audio\\test.wav",
+            L"..\\audio\\test2.wav",
+            L"..\\audio\\test3.wav"
         };
         
         // 预加载三段音频
