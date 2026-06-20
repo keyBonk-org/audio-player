@@ -23,8 +23,8 @@ int main()
         // 获取音频池单例
         yumo::AudioPool& pool = yumo::AudioPool::getInstance();
         
-        // 使用绝对路径测试
-        const wchar_t* filename = L"c:\\小狄\\audio-player\\test\\audio\\test.wav";
+        // 使用相对路径测试
+        const wchar_t* filename = L"..\\audio\\test.wav";
         std::wcout << L"\n添加音频: " << filename << std::endl;
         
         std::atomic<bool> ready(false);
