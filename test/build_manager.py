@@ -101,7 +101,7 @@ def compile_file(src_path, exe_name=None):
     print(f"命令: {' '.join(cmd)}")
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
         if result.returncode == 0:
             print(f"成功: {exe_name}")
             return True
@@ -118,7 +118,7 @@ def main():
     files = scan_test_files()
 
     if not files:
-        print("未找到测试文件")
+        input("未找到测试文件，按回车键继续")
         return
 
     ensure_output_dir()
@@ -136,7 +136,7 @@ def main():
     try:
         selection = input("输入想要编译的文件: ").strip()
         if not selection:
-            print("未输入任何选择，退出")
+            input("未输入任何选择，按回车键继续")
             return
 
         # 处理 all 选项
@@ -146,7 +146,7 @@ def main():
             selected_ids = parse_selection(selection)
 
         if not selected_ids:
-            print("没有有效的选择，退出")
+            input("没有有效的选择，按回车键继续")
             return
 
         # 构建 id -> file 映射
@@ -168,10 +168,14 @@ def main():
         print("\n" + "=" * 50)
         print(f"编译完成: 成功 {success_count}, 失败 {fail_count}")
         print("=" * 50)
+        
+        input("按回车键结束本轮编译")
 
     except KeyboardInterrupt:
         print("\n已取消")
 
 
 if __name__ == "__main__":
-    main()
+    while True:
+        os.system('cls')
+        main()
