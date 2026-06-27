@@ -9,6 +9,7 @@
 #include <functional>
 #include <thread>
 #include <atomic>
+#include <queue>
 
 namespace
 {
@@ -117,6 +118,17 @@ namespace yumo
         return preloadedId;
     }
 
+    // 分配新的播放实例ID（使用回收机制）
+    size_t AudioPool::allocateInstanceId()
+    {
+        if (!freeInstanceIds_.empty()) {
+            size_t id = freeInstanceIds_.front();
+            freeInstanceIds_.pop();
+            return id;
+        }
+        return nextInstanceId_++;
+    }
+
     // 添加预加载音频并立即播放
     size_t AudioPool::addAudio(size_t preloadedId, float volume)
     {
@@ -135,9 +147,11 @@ namespace yumo
         instance.position = 0;
         instance.volume = volume;
         instance.active = true;
+        instance.stopped = false;
+        instance.muted = false;
 
-        playInstances_.push_back(instance);
-        size_t instanceId = playInstances_.size() - 1;
+        size_t instanceId = allocateInstanceId();
+        playInstances_[instanceId] = instance;
 
         // 如果设备未打开，则打开
         if (!hWaveOut_) {
@@ -148,12 +162,16 @@ namespace yumo
         return instanceId;
     }
 
-    // 添加音频文件并立即播放（简化用法）
-    size_t AudioPool::addAudio(const wchar_t* filename, float volume, std::atomic<bool>* ready)
+    // 添加音频文件并立即播放（便利接口）
+    void AudioPool::addAudio(const wchar_t* filename, float volume, size_t* instanceId, std::atomic<bool>* ready)
     {
         auto readyPtr = ready
             ? std::shared_ptr<std::atomic<bool>>(ready, [](std::atomic<bool>*){})
             : std::make_shared<std::atomic<bool>>(false);
+
+        auto instanceIdPtr = instanceId
+            ? std::shared_ptr<size_t>(instanceId, [](size_t*){})
+            : std::make_shared<size_t>(0);
 
         if (ready) {
             *ready = false;
@@ -161,25 +179,64 @@ namespace yumo
 
         size_t preloadedId = preloadAudio(filename, readyPtr.get());
 
-        std::thread([this, preloadedId, readyPtr, volume]() {
+        std::thread([this, preloadedId, readyPtr, instanceIdPtr, volume]() {
             while (!readyPtr->load()) {
                 Sleep(10);
             }
 
+            readyPtr->store(false);
+
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (preloadedId >= preloadedAudios_.size() || preloadedAudios_[preloadedId]->data.empty()) {
+                    readyPtr->store(true);
                     return;
                 }
             }
 
             try {
-                addAudio(preloadedId, volume);
+                size_t id = addAudio(preloadedId, volume);
+                *instanceIdPtr = id;
+
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (preloadedId < preloadedAudios_.size()) {
+                        preloadedAudios_[preloadedId]->markedForRemoval = true;
+                    }
+                }
+
+                readyPtr->store(true);
             } catch (...) {
+                readyPtr->store(true);
             }
         }).detach();
+    }
 
-        return preloadedId;
+    // 移除预加载音频对象
+    void AudioPool::removePreloadedAudio(size_t preloadedId)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        if (preloadedId >= preloadedAudios_.size()) {
+            return;
+        }
+
+        // 检查是否有播放实例正在引用该预加载对象
+        bool isReferenced = false;
+        for (const auto& inst : playInstances_) {
+            if (inst.second.active && inst.second.source == preloadedAudios_[preloadedId].get()) {
+                isReferenced = true;
+                break;
+            }
+        }
+
+        if (!isReferenced) {
+            // 没有被引用，可以安全删除
+            preloadedAudios_[preloadedId].reset();
+        } else {
+            // 被引用，标记为待删除，播放结束后删除
+            preloadedAudios_[preloadedId]->markedForRemoval = true;
+        }
     }
 
     // 获取预加载音频数量
@@ -200,9 +257,10 @@ namespace yumo
     bool AudioPool::isPlaying(size_t instanceId) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (instanceId >= playInstances_.size())
+        auto it = playInstances_.find(instanceId);
+        if (it == playInstances_.end())
             return false;
-        const auto& inst = playInstances_[instanceId];
+        const auto& inst = it->second;
         return inst.active && inst.source && inst.position < inst.source->data.size();
     }
 
@@ -217,37 +275,35 @@ namespace yumo
             return;
         }
 
-        // 如果静音，跳过mix处理但继续推进position（性能优化）
-        if (isMuted_) {
-            // 推进所有激活播放实例的位置
-            for (auto& inst : playInstances_) {
-                if (!inst.active || !inst.source || inst.position >= inst.source->data.size())
-                    continue;
-                size_t remaining = inst.source->data.size() - inst.position;
-                size_t samplesToAdvance = std::min(chunkSize, remaining);
-                inst.position += samplesToAdvance;
-            }
-            // 输出静默
-            memset(output, 0, chunkSize * sizeof(int16_t));
-            return;
-        }
-
         // 清空输出缓冲区
         memset(output, 0, chunkSize * sizeof(int16_t));
 
         // 混合所有激活的播放实例
         for (auto& inst : playInstances_) {
-            if (!inst.active || !inst.source || inst.position >= inst.source->data.size())
+            if (!inst.second.active || !inst.second.source || inst.second.position >= inst.second.source->data.size())
                 continue;
 
-            const auto& data = inst.source->data;
-            size_t remaining = data.size() - inst.position;
+            // 如果该实例被暂停（stop），位置不推进（真正暂停）
+            if (inst.second.stopped) {
+                continue;
+            }
+
+            // 如果全局静音或实例静音，跳过混音但继续推进position
+            if (isMuted_ || inst.second.muted) {
+                size_t remaining = inst.second.source->data.size() - inst.second.position;
+                size_t samplesToAdvance = std::min(chunkSize, remaining);
+                inst.second.position += samplesToAdvance;
+                continue;
+            }
+
+            const auto& data = inst.second.source->data;
+            size_t remaining = data.size() - inst.second.position;
             size_t samplesToCopy = std::min(chunkSize, remaining);
 
             for (size_t i = 0; i < samplesToCopy; ++i) {
                 // 应用音量并混合
                 int32_t mixed = static_cast<int32_t>(output[i]) +
-                    static_cast<int32_t>(data[inst.position + i] * inst.volume);
+                    static_cast<int32_t>(data[inst.second.position + i] * inst.second.volume);
 
                 // 防止溢出
                 if (mixed > INT16_MAX) mixed = INT16_MAX;
@@ -257,7 +313,7 @@ namespace yumo
             }
 
             // 更新播放位置
-            inst.position += samplesToCopy;
+            inst.second.position += samplesToCopy;
         }
     }
 
@@ -287,9 +343,25 @@ namespace yumo
             }
             // 如果有激活的实例还没播完，就继续
             for (const auto& inst : pPool->playInstances_) {
-                if (inst.active && inst.source && inst.position < inst.source->data.size()) {
+                if (inst.second.active && inst.second.source && inst.second.position < inst.second.source->data.size()) {
                     allFinished = false;
                     break;
+                }
+            }
+
+            // 清理标记为待删除且没有被引用的预加载对象
+            for (size_t i = 0; i < pPool->preloadedAudios_.size(); ++i) {
+                if (pPool->preloadedAudios_[i] && pPool->preloadedAudios_[i]->markedForRemoval) {
+                    bool isReferenced = false;
+                    for (const auto& inst : pPool->playInstances_) {
+                        if (inst.second.active && inst.second.source == pPool->preloadedAudios_[i].get()) {
+                            isReferenced = true;
+                            break;
+                        }
+                    }
+                    if (!isReferenced) {
+                        pPool->preloadedAudios_[i].reset();
+                    }
                 }
             }
         }
@@ -330,8 +402,8 @@ namespace yumo
         // 只重置还在播放的实例的位置（position < data.size()）
         // 已播放完毕的实例不重置，让它们保持结束状态
         for (auto& inst : playInstances_) {
-            if (inst.active && inst.source && inst.position < inst.source->data.size()) {
-                inst.position = 0;
+            if (inst.second.active && inst.second.source && inst.second.position < inst.second.source->data.size()) {
+                inst.second.position = 0;
             }
         }
 
@@ -396,11 +468,10 @@ namespace yumo
     {
         std::lock_guard<std::mutex> lock(mutex_);
         isStopped_ = false;
-        isMuted_ = false;
     }
 
-    // 设置静音状态
-    void AudioPool::setMuted(bool muted)
+    // 设置全局静音状态
+    void AudioPool::setGlobalMute(bool muted)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         isMuted_ = muted;
@@ -411,7 +482,7 @@ namespace yumo
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto& inst : playInstances_) {
-            inst.position = 0;
+            inst.second.position = 0;
         }
     }
 
@@ -419,20 +490,71 @@ namespace yumo
     void AudioPool::setVolume(size_t instanceId, float volume)
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (instanceId >= playInstances_.size())
+        auto it = playInstances_.find(instanceId);
+        if (it == playInstances_.end())
             throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"无效的播放实例ID");
-        
-        playInstances_[instanceId].volume = std::max(0.0f, std::min(1.0f, volume));
+
+        it->second.volume = std::max(0.0f, std::min(1.0f, volume));
     }
 
     // 获取播放实例音量
     float AudioPool::getVolume(size_t instanceId) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (instanceId >= playInstances_.size())
+        auto it = playInstances_.find(instanceId);
+        if (it == playInstances_.end())
             throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"无效的播放实例ID");
-        
-        return playInstances_[instanceId].volume;
+
+        return it->second.volume;
+    }
+
+    // 停止指定播放实例
+    bool AudioPool::stop(size_t instanceId)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = playInstances_.find(instanceId);
+        if (it == playInstances_.end())
+            return false;
+
+        it->second.stopped = true;
+        return true;
+    }
+
+    // 恢复指定播放实例
+    bool AudioPool::resume(size_t instanceId)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = playInstances_.find(instanceId);
+        if (it == playInstances_.end())
+            return false;
+
+        it->second.stopped = false;
+        return true;
+    }
+
+    // 设置指定播放实例的静音状态
+    bool AudioPool::setMuted(size_t instanceId, bool muted)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = playInstances_.find(instanceId);
+        if (it == playInstances_.end())
+            return false;
+
+        it->second.muted = muted;
+        return true;
+    }
+
+    // 移除播放实例
+    bool AudioPool::remove(size_t instanceId)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = playInstances_.find(instanceId);
+        if (it == playInstances_.end())
+            return false;
+
+        playInstances_.erase(it);
+        freeInstanceIds_.push(instanceId);
+        return true;
     }
 
     // 从磁盘加载WAV文件，解析其格式块和数据块，填充WavInfo结构体

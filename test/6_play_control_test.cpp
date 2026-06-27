@@ -53,7 +53,7 @@ int main()
         size_t inst1 = pool.addAudio(id1);
         size_t inst2 = pool.addAudio(id2);
         size_t inst3 = pool.addAudio(id3);
-        pool.setMuted(false); // 取消静音开始播放
+        pool.setGlobalMute(false); // 取消静音开始播放
         
         std::wcout << L"播放实例ID: " << inst1 << L", " << inst2 << L", " << inst3 << std::endl;
         std::wcout << L"播放实例数: " << pool.getPlayingCount() << std::endl;
@@ -64,13 +64,13 @@ int main()
         
         // 静音5秒（position继续推进）
         std::wcout << L"\n=== 静音 ===" << std::endl;
-        pool.setMuted(true);
+        pool.setGlobalMute(true);
         std::wcout << L"[静音中] 等待5秒...（音频仍在播放，只是听不到）" << std::endl;
         std::this_thread::sleep_for(std::chrono::seconds(5));
         
         // 恢复播放
         std::wcout << L"\n=== 恢复播放 ===" << std::endl;
-        pool.setMuted(false);
+        pool.setGlobalMute(false);
         std::wcout << L"[播放中] 等待5秒...（从静音结束的位置继续）" << std::endl;
         std::this_thread::sleep_for(std::chrono::seconds(5));
         

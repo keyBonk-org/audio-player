@@ -30,12 +30,23 @@ int main()
             L"..\\audio\\test3.wav"
         };
         
-        std::wcout << L"\n使用 addAudio(filename) 字符串版本（异步加载，立即返回）..." << std::endl;
+        std::wcout << L"\n使用 addAudio(filename) 字符串版本（便利接口，异步加载播放）..." << std::endl;
+        size_t instanceIds[3] = {0, 0, 0};
+        std::atomic<bool> readyFlags[3] = {false, false, false};
+
         for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); ++i) {
             std::wcout << L"\n添加音频: " << files[i] << std::endl;
-            // 立即返回，加载和播放都在后台完成
-            size_t preloadedId = pool.addAudio(files[i]);  
-            std::wcout << L"  -> 预加载ID: " << preloadedId << L" (立即返回，后台加载播放)" << std::endl;
+            // 便利接口，异步加载并播放，播放完成后自动清理预加载对象
+            pool.addAudio(files[i], 1.0f, &instanceIds[i], &readyFlags[i]);
+            std::wcout << L"  -> 后台加载播放，instanceId 将在播放开始后写入" << std::endl;
+        }
+
+        std::wcout << L"\n等待所有音频加载完成..." << std::endl;
+        for (size_t i = 0; i < 3; ++i) {
+            while (!readyFlags[i].load()) {
+                Sleep(10);
+            }
+            std::wcout << L"  音频 " << i << L" 加载完成，instanceId=" << instanceIds[i] << std::endl;
         }
         
         std::wcout << L"\n所有音频已提交加载！" << std::endl;

@@ -33,7 +33,7 @@ void testAudioFile(const wchar_t* filename)
         pool.resume();  // 重置停止状态，确保新音频能正常播放
      
         size_t instanceId = pool.addAudio(preloadedId);
-        pool.setMuted(false); // 取消静音开始播放
+        pool.setGlobalMute(false); // 取消静音开始播放
    
         std::wcout << L"正在播放... 播放实例ID: " << instanceId << std::endl;
         

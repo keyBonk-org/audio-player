@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <map>
 #include <mutex>
+#include <queue>
 
 namespace yumo
 {
@@ -36,25 +37,28 @@ namespace yumo
 
     /**
      * @brief 预加载音频信息结构体
-     * 
+     *
      * 存储重采样后的标准格式音频数据，作为共享数据源
      * 同一个预加载音频可以被多次添加播放，每次创建独立的播放实例
      */
     struct PreloadedAudio {
-        StandardWavInfo data;  // 重采样后的音频数据（44.1kHz, 双声道, 16位）
+        StandardWavInfo data;        // 重采样后的音频数据（44.1kHz, 双声道, 16位）
+        bool markedForRemoval = false;  // 标记为待删除（播放结束后清理）
     };
 
     /**
      * @brief 播放实例结构体
-     * 
+     *
      * 每次 addAudio 创建一个播放实例，追踪独立的播放位置
      * 多个实例可以引用同一个预加载音频，实现同一音频的重复播放
      */
     struct PlayInstance {
-        PreloadedAudio* source;  // 指向共享的预加载音频数据
-        size_t position;              // 当前播放位置（样本索引）
+        PreloadedAudio* source;      // 指向共享的预加载音频数据
+        size_t position;             // 当前播放位置（样本索引）
         float volume;                // 音量（0.0-1.0）
         bool active;                 // 是否激活播放
+        bool stopped;                // 是否暂停（与active区别：stopped时位置不推进）
+        bool muted;                  // 是否静音（跳过混音但位置继续推进）
     };
 
     /**
@@ -95,17 +99,27 @@ namespace yumo
         size_t addAudio(size_t preloadedId, float volume = 1.0f);
 
         /**
-         * @brief 添加音频文件到播放池并立即播放
-         * 
-         * 简化用法，内部自动完成异步预加载和添加播放
-         * 会等待加载完成后再添加播放
-         * 
+         * @brief 添加音频文件到播放池并立即播放（便利接口）
+         *
+         * 简化用法，内部自动完成异步预加载和添加播放。
+         * 播放完成后自动移除预加载对象（用完即弃）。
+         *
          * @param filename WAV文件路径
          * @param volume 音量（0.0-1.0），默认为 1.0
-         * @param ready 可选的加载状态标记（用户提供，用于检查加载完成）
-         * @return 预加载音频ID
+         * @param instanceId 可选的播放实例ID输出（播放开始后写入）
+         * @param ready 可选的加载状态标记（加载完成后变为true）
          */
-        size_t addAudio(const wchar_t* filename, float volume = 1.0f, std::atomic<bool>* ready = nullptr);
+        void addAudio(const wchar_t* filename, float volume = 1.0f, size_t* instanceId = nullptr, std::atomic<bool>* ready = nullptr);
+
+        /**
+         * @brief 移除预加载音频对象
+         *
+         * 从预加载队列中移除不再需要的音频对象。
+         * 注意：如果该预加载对象正在被播放实例引用，播放会继续直到结束。
+         *
+         * @param preloadedId preloadAudio 返回的预加载音频ID
+         */
+        void removePreloadedAudio(size_t preloadedId);
 
         /**
          * @brief 获取预加载音频数量
@@ -138,11 +152,11 @@ namespace yumo
         void resume();
 
         /**
-         * @brief 设置静音状态
-         * 
+         * @brief 设置全局静音状态
+         *
          * @param muted true=静音，false=取消静音
          */
-        void setMuted(bool muted);
+        void setGlobalMute(bool muted);
 
         /**
          * @brief 重置所有播放实例的位置到开头
@@ -151,7 +165,7 @@ namespace yumo
 
         /**
          * @brief 设置播放实例音量
-         * 
+         *
          * @param instanceId 播放实例ID
          * @param volume 音量（0.0-1.0）
          */
@@ -162,6 +176,41 @@ namespace yumo
          */
         float getVolume(size_t instanceId) const;
 
+        /**
+         * @brief 停止指定播放实例
+         *
+         * @param instanceId 播放实例ID
+         * @return true=成功，false=无效ID
+         */
+        bool stop(size_t instanceId);
+
+        /**
+         * @brief 恢复指定播放实例
+         *
+         * @param instanceId 播放实例ID
+         * @return true=成功，false=无效ID
+         */
+        bool resume(size_t instanceId);
+
+        /**
+         * @brief 设置指定播放实例的静音状态
+         *
+         * @param instanceId 播放实例ID
+         * @param muted true=静音，false=取消静音
+         * @return true=成功，false=无效ID
+         */
+        bool setMuted(size_t instanceId, bool muted);
+
+        /**
+         * @brief 移除播放实例
+         *
+         * 从播放队列中移除指定实例，释放其资源
+         *
+         * @param instanceId 播放实例ID
+         * @return true=成功，false=无效ID
+         */
+        bool remove(size_t instanceId);
+
         // 禁用拷贝构造和赋值
         AudioPool(const AudioPool&) = delete;
         AudioPool& operator=(const AudioPool&) = delete;
@@ -170,13 +219,18 @@ namespace yumo
         AudioPool() = default;
         ~AudioPool() = default;
 
+        // 获取新的播放实例ID（使用回收机制）
+        size_t allocateInstanceId();
+
         std::vector<std::unique_ptr<PreloadedAudio>> preloadedAudios_;   // 预加载的音频数据（共享数据源）
-        std::vector<PlayInstance> playInstances_;      // 当前播放的实例（独立位置追踪）
-        mutable std::mutex mutex_;                     // 线程安全锁
-        bool isPlaying_ = false;                        // 是否正在播放
-        bool isMuted_ = false;                         // 是否静音（继续播放但跳过mix）
-        bool isStopped_ = false;                       // 是否停止（挂起播放，不处理数据）
-        HWAVEOUT hWaveOut_ = nullptr;                  // 音频设备句柄
+        std::map<size_t, PlayInstance> playInstances_;                  // 当前播放的实例（ID→实例）
+        std::queue<size_t> freeInstanceIds_;                            // 可回收的实例ID队列
+        size_t nextInstanceId_ = 0;                                     // 下一个新ID
+        mutable std::mutex mutex_;                                     // 线程安全锁
+        bool isPlaying_ = false;                                       // 是否正在播放
+        bool isMuted_ = false;                                        // 是否全局静音（继续播放但跳过mix）
+        bool isStopped_ = false;                                      // 是否停止（挂起播放，不处理数据）
+        HWAVEOUT hWaveOut_ = nullptr;                                 // 音频设备句柄
 
         // 双缓冲常量
         static const size_t BUFFER_COUNT = 2;           // 缓冲区数量
