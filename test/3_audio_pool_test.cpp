@@ -3,7 +3,6 @@
 #include <iostream>
 #include <io.h>
 #include <fcntl.h>
-#include <atomic>
 
 int main()
 {
@@ -29,7 +28,7 @@ int main()
         
         std::wcout << L"\n使用 addAudio(filename) 字符串版本（便利接口，异步加载播放）..." << std::endl;
         size_t instanceIds[3] = {0, 0, 0};
-        std::atomic<bool> readyFlags[3] = {false, false, false};
+        yumo::readySign readyFlags[3] = {false, false, false};
 
         for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); ++i) {
             std::wcout << L"\n添加音频: " << files[i] << std::endl;
@@ -40,7 +39,7 @@ int main()
 
         std::wcout << L"\n等待所有音频加载完成..." << std::endl;
         for (size_t i = 0; i < 3; ++i) {
-            while (!readyFlags[i].load()) {
+            while (!readyFlags[i]) {
                 Sleep(10);
             }
             std::wcout << L"  音频 " << i << L" 加载完成，instanceId=" << instanceIds[i] << std::endl;

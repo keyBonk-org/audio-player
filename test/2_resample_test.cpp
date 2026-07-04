@@ -4,7 +4,6 @@
 #include <io.h>
 #include <fcntl.h>
 #include <string>
-#include <atomic>
 
 void testAudioFile(const wchar_t* filename)
 {
@@ -14,11 +13,11 @@ void testAudioFile(const wchar_t* filename)
         
         // 预加载音频
         std::wcout << L"正在预加载音频..." << std::endl;
-        std::atomic<bool> ready(false);
+        yumo::readySign ready(false);
         size_t preloadedId = yumo::preloadAudio(filename, &ready);
         
         // 等待加载完成
-        while (!ready.load()) {
+        while (!ready) {
             Sleep(10);
         }
         std::wcout << L"预加载完成！ID: " << preloadedId << std::endl;

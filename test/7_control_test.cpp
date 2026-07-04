@@ -17,9 +17,9 @@ struct AudioStatus {
 
 void printStatus(AudioStatus audios[], size_t count) {
     std::wcout << L"\n当前音频状态:" << std::endl;
-    std::wcout << L"  全局状态: 音量" << yumo::global.volume.load() 
-               << L"  " << (yumo::global.mute.load() ? L"全局静音" : L"全局非静音")
-               << L"  " << (yumo::global.stop.load() ? L"全局停止" : L"全局运行") << std::endl;
+    std::wcout << L"  全局状态: 音量" << yumo::global.volume 
+               << L"  " << (yumo::global.mute ? L"全局静音" : L"全局非静音")
+               << L"  " << (yumo::global.stop ? L"全局停止" : L"全局运行") << std::endl;
     for (size_t i = 0; i < count; ++i) {
         std::wcout << L"  " << (i + 1) << L"：";
         if (audios[i].isPlaying) {
@@ -87,7 +87,7 @@ int main() {
         };
 
         AudioStatus audios[3] = {};
-        std::atomic<bool> readyFlags[3] = {false, false, false};
+        yumo::readySign readyFlags[3] = {false, false, false};
 
         std::wcout << L"\n预加载音频..." << std::endl;
         for (size_t i = 0; i < 3; ++i) {
@@ -101,7 +101,7 @@ int main() {
 
         std::wcout << L"\n等待预加载完成..." << std::endl;
         for (size_t i = 0; i < 3; ++i) {
-            while (!readyFlags[i].load()) {
+            while (!readyFlags[i]) {
                 Sleep(10);
             }
             std::wcout << L"  音频 " << (i + 1) << L" 预加载完成" << std::endl;
@@ -253,7 +253,7 @@ int main() {
                     break;
                 }
                 case 9: {
-                    bool newMuted = !yumo::global.mute.load();
+                    bool newMuted = !yumo::global.mute;
                     yumo::global.mute = newMuted;
                     std::wcout << (newMuted ? L"已全局静音" : L"已取消全局静音") << std::endl;
                     break;

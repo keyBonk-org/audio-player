@@ -78,11 +78,11 @@ namespace yumo
     }
 
     // 预加载音频文件（异步）
-    size_t AudioPool::preloadAudio(const wchar_t* filename, std::atomic<bool>* ready)
+    size_t AudioPool::preloadAudio(const wchar_t* filename, readySign* ready)
     {
         auto readyPtr = ready
-            ? std::shared_ptr<std::atomic<bool>>(ready, [](std::atomic<bool>*){})
-            : std::make_shared<std::atomic<bool>>(false);
+            ? std::shared_ptr<readySign>(ready, [](readySign*){})
+            : std::make_shared<readySign>(false);
 
         if (ready) {
             *ready = false;
@@ -163,11 +163,11 @@ namespace yumo
     }
 
     // 添加音频文件并立即播放（便利接口）
-    void AudioPool::addAudio(const wchar_t* filename, float volume, size_t* instanceId, std::atomic<bool>* ready)
+    void AudioPool::addAudio(const wchar_t* filename, float volume, size_t* instanceId, readySign* ready)
     {
         auto readyPtr = ready
-            ? std::shared_ptr<std::atomic<bool>>(ready, [](std::atomic<bool>*){})
-            : std::make_shared<std::atomic<bool>>(false);
+            ? std::shared_ptr<readySign>(ready, [](readySign*){})
+            : std::make_shared<readySign>(false);
 
         auto instanceIdPtr = instanceId
             ? std::shared_ptr<size_t>(instanceId, [](size_t*){})
@@ -270,7 +270,7 @@ namespace yumo
         std::lock_guard<std::mutex> lock(mutex_);
 
         // 如果停止（挂起），输出静默但不推进position
-        if (global.stop.load()) {
+        if (global.stop) {
             memset(output, 0, chunkSize * sizeof(int16_t));
             return;
         }
@@ -289,7 +289,7 @@ namespace yumo
             }
 
             // 如果全局静音或实例静音，跳过混音但继续推进position
-            if (global.mute.load() || inst.second.muted) {
+            if (global.mute || inst.second.muted) {
                 size_t remaining = inst.second.source->data.size() - inst.second.position;
                 size_t samplesToAdvance = std::min(chunkSize, remaining);
                 inst.second.position += samplesToAdvance;
