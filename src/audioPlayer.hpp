@@ -13,6 +13,44 @@
 
 namespace yumo
 {
+    template<typename T>
+    class atomic {
+    private:
+        std::atomic<T> value_;
+    public:
+        atomic() = default;
+        atomic(T val) : value_(val) {}
+        
+        atomic& operator=(T val) {
+            value_.store(val, std::memory_order_relaxed);
+            return *this;
+        }
+        
+        operator T() const {
+            return value_.load(std::memory_order_relaxed);
+        }
+        
+        bool operator==(T other) const {
+            return value_.load(std::memory_order_relaxed) == other;
+        }
+        
+        bool operator!=(T other) const {
+            return value_.load(std::memory_order_relaxed) != other;
+        }
+        
+        T load(std::memory_order order = std::memory_order_relaxed) const {
+            return value_.load(order);
+        }
+        
+        void store(T val, std::memory_order order = std::memory_order_relaxed) {
+            value_.store(val, order);
+        }
+    };
+
+    using readySign = atomic<bool>;
+    using switchSign = atomic<bool>;
+    using volumeSign = atomic<float>;
+
     /**
      * @brief 音频控制信号类
      *
@@ -21,9 +59,9 @@ namespace yumo
      */
     class audioSign {
     public:
-        std::atomic<bool> mute{false};   // 全局静音
-        std::atomic<bool> stop{false};   // 全局停止（挂起）
-        std::atomic<float> volume{1.0f}; // 全局音量（0.0-1.0）
+        switchSign mute{false};   // 全局静音
+        switchSign stop{false};   // 全局停止（挂起）
+        volumeSign volume{1.0f};  // 全局音量（0.0-1.0）
     };
 
     inline audioSign global;
@@ -101,7 +139,7 @@ namespace yumo
          * @param ready 可选的加载状态标记（调用时设为false，加载完成后变为true）
          * @return 预加载音频ID（用于后续 addAudio）
          */
-        size_t preloadAudio(const wchar_t* filename, std::atomic<bool>* ready = nullptr);
+        size_t preloadAudio(const wchar_t* filename, readySign* ready = nullptr);
 
         /**
          * @brief 添加预加载音频到播放池并立即播放
@@ -125,7 +163,7 @@ namespace yumo
          * @param instanceId 可选的播放实例ID输出（播放开始后写入）
          * @param ready 可选的加载状态标记（加载完成后变为true）
          */
-        void addAudio(const wchar_t* filename, float volume = 1.0f, size_t* instanceId = nullptr, std::atomic<bool>* ready = nullptr);
+        void addAudio(const wchar_t* filename, float volume = 1.0f, size_t* instanceId = nullptr, readySign* ready = nullptr);
 
         /**
          * @brief 移除预加载音频对象
@@ -256,7 +294,7 @@ namespace yumo
 
     // ===== 全局函数包装层 =====
 
-    inline size_t preloadAudio(const wchar_t* filename, std::atomic<bool>* ready = nullptr) {
+    inline size_t preloadAudio(const wchar_t* filename, readySign* ready = nullptr) {
         return AudioPool::getInstance().preloadAudio(filename, ready);
     }
 
@@ -264,7 +302,7 @@ namespace yumo
         return AudioPool::getInstance().addAudio(preloadedId, volume);
     }
 
-    inline void addAudio(const wchar_t* filename, float volume = 1.0f, size_t* instanceId = nullptr, std::atomic<bool>* ready = nullptr) {
+    inline void addAudio(const wchar_t* filename, float volume = 1.0f, size_t* instanceId = nullptr, readySign* ready = nullptr) {
         AudioPool::getInstance().addAudio(filename, volume, instanceId, ready);
     }
 

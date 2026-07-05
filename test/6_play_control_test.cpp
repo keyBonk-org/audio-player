@@ -3,7 +3,6 @@
 #include <iostream>
 #include <io.h>
 #include <fcntl.h>
-#include <atomic>
 #include <thread>
 #include <chrono>
 
@@ -32,7 +31,7 @@ int main()
         
         // 预加载三段音频
         std::wcout << L"\n=== 预加载音频 ===" << std::endl;
-        std::atomic<bool> ready1(false), ready2(false), ready3(false);
+        yumo::readySign ready1(false), ready2(false), ready3(false);
         size_t id1 = yumo::preloadAudio(files[0], &ready1);
         size_t id2 = yumo::preloadAudio(files[1], &ready2);
         size_t id3 = yumo::preloadAudio(files[2], &ready3);
@@ -41,7 +40,7 @@ int main()
         
         // 等待所有音频加载完成
         std::wcout << L"等待加载完成..." << std::endl;
-        while (!ready1.load() || !ready2.load() || !ready3.load()) {
+        while (!ready1 || !ready2 || !ready3) {
             Sleep(10);
         }
         std::wcout << L"所有音频加载完成！" << std::endl;

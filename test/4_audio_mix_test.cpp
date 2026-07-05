@@ -5,7 +5,6 @@
 #include <fcntl.h>
 #include <thread>
 #include <chrono>
-#include <atomic>
 
 int main()
 {
@@ -26,7 +25,7 @@ int main()
         
         std::wcout << L"\n异步预加载音频文件..." << std::endl;
         size_t preloadedIds[3];
-        std::atomic<bool> readyFlags[3] = {false, false, false};
+        yumo::readySign readyFlags[3] = {false, false, false};
         
         for (size_t i = 0; i < 3; ++i) {
             std::wcout << L"  预加载: " << files[i] << L" (后台加载)" << std::endl;

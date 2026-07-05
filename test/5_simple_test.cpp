@@ -3,7 +3,6 @@
 #include <iostream>
 #include <io.h>
 #include <fcntl.h>
-#include <atomic>
 
 int main()
 {
@@ -24,13 +23,13 @@ int main()
         const wchar_t* filename = L"..\\audio\\test.wav";
         std::wcout << L"\n添加音频: " << filename << std::endl;
         
-        std::atomic<bool> ready(false);
+        yumo::readySign ready(false);
         size_t preloadedId = yumo::preloadAudio(filename, &ready);
         std::wcout << L"预加载ID: " << preloadedId << std::endl;
         
         // 等待加载完成
         std::wcout << L"等待加载..." << std::endl;
-        while (!ready.load()) {
+        while (!ready) {
             Sleep(10);
         }
         std::wcout << L"加载完成！" << std::endl;
