@@ -565,7 +565,7 @@ namespace
     }
 
     // 音频播放回调
-    void CALLBACK AudioPool::waveOutCallback(HWAVEOUT hwo, UINT uMsg, DWORD_PTR dwInstance, DWORD_PTR dwParam1, DWORD_PTR dwParam2)
+    void CALLBACK AudioPool::waveOutCallback(HWAVEOUT hwo, UINT uMsg, DWORD_PTR dwInstance, DWORD_PTR dwParam1, [[maybe_unused]] DWORD_PTR dwParam2)
     {
         if (uMsg != WOM_DONE)
             return;
