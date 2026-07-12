@@ -1,6 +1,6 @@
 #include "../src/audioPlayer.hpp"
 #include "../src/yumo_except.hpp"
-#include<windows.h>
+#include <windows.h>
 #include <iostream>
 #include <io.h>
 #include <fcntl.h>
