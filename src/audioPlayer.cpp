@@ -8,8 +8,17 @@
 #include <cassert>
 #include <functional>
 #include <thread>
-#include <atomic>
 #include <queue>
+#include <windows.h>
+#include <mmreg.h>
+#include <msacm.h>
+#include <stdio.h>
+#include <memory>
+#include <vector>
+#include <cstdint>
+#include <algorithm>
+#include <map>
+#include <mutex>
 
 namespace
 {
@@ -184,28 +193,6 @@ namespace
          * @brief 检查指定ID的播放实例是否正在播放
          */
         bool isPlaying(size_t instanceId) const;
-
-        /**
-         * @brief 停止所有播放（挂起）
-         *
-         * 挂起播放，不处理数据，等待恢复
-         * 调用 resume() 可恢复播放
-         */
-        void stopAll();
-
-        /**
-         * @brief 恢复播放
-         *
-         * 取消停止和静音状态，继续播放
-         */
-        void resume();
-
-        /**
-         * @brief 设置全局静音状态
-         *
-         * @param muted true=静音，false=取消静音
-         */
-        void setGlobalMute(bool muted);
 
         /**
          * @brief 重置所有播放实例的位置到开头
@@ -714,24 +701,6 @@ namespace
         }
     }
 
-    // 停止所有播放（挂起）
-    void AudioPool::stopAll()
-    {
-        yumo::global.stop.store(true);
-    }
-
-    // 恢复播放
-    void AudioPool::resume()
-    {
-        yumo::global.stop.store(false);
-    }
-
-    // 设置全局静音状态
-    void AudioPool::setGlobalMute(bool muted)
-    {
-        yumo::global.mute.store(muted);
-    }
-
     // 重置所有播放实例的位置到开头
     void AudioPool::resetAll()
     {
@@ -1098,21 +1067,6 @@ namespace yumo
     bool isPlaying(size_t instanceId)
     {
         return AudioPool::getInstance().isPlaying(instanceId);
-    }
-
-    void stopAll()
-    {
-        AudioPool::getInstance().stopAll();
-    }
-
-    void resume()
-    {
-        AudioPool::getInstance().resume();
-    }
-
-    void setGlobalMute(bool muted)
-    {
-        AudioPool::getInstance().setGlobalMute(muted);
     }
 
     void resetAll()
