@@ -380,13 +380,7 @@ namespace
     // 添加音频文件并立即播放（便利接口）
     void AudioPool::addAudio(const wchar_t *filename, float volume, size_t *instanceId, yumo::readySign *ready)
     {
-        auto readyPtr = ready
-                            ? std::shared_ptr<yumo::readySign>(ready, [](yumo::readySign *) {})
-                            : std::make_shared<yumo::readySign>(false);
-
-        auto instanceIdPtr = instanceId
-                                 ? std::shared_ptr<size_t>(instanceId, [](size_t *) {})
-                                 : std::make_shared<size_t>(0);
+        auto readyPtr = std::make_shared<yumo::readySign>(false);
 
         if (ready)
         {
@@ -395,36 +389,44 @@ namespace
 
         size_t preloadedId = preloadAudio(filename, readyPtr.get());
 
-        std::thread([this, preloadedId, readyPtr, instanceIdPtr, volume]()
+        std::thread([this, preloadedId, readyPtr, instanceId, ready, volume]()
                     {
             while (!readyPtr->load()) {
                 Sleep(10);
             }
 
-            readyPtr->store(false);
-
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (preloadedId >= preloadedAudios_.size() || preloadedAudios_[preloadedId]->data.empty()) {
-                    readyPtr->store(true);
+                    if (ready){
+						ready->store(true);
+					}
+					if (preloadedId < preloadedAudios_.size()) {
+                        preloadedAudios_[preloadedId]->markedForRemoval = true;
+                    }
                     return;
                 }
             }
 
             try {
                 size_t id = addAudio(preloadedId, volume);
-                *instanceIdPtr = id;
-
+				if (instanceId){
+					*instanceId = id;
+				}
+				
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (preloadedId < preloadedAudios_.size()) {
                         preloadedAudios_[preloadedId]->markedForRemoval = true;
                     }
                 }
-
-                readyPtr->store(true);
+				if (ready){
+					ready->store(true);
+				}
             } catch (...) {
-                readyPtr->store(true);
+				if (ready){
+					ready->store(true);
+				}
             } })
             .detach();
     }
