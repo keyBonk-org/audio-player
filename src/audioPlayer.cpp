@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <map>
 #include <mutex>
+#include <string>
 
 namespace
 {
@@ -92,6 +93,26 @@ namespace
     typedef std::vector<int16_t> StandardWavInfo;
 
     /**
+     * @brief MP3帧信息结构体
+     *
+     * 用于存储MP3文件的帧信息，包括采样率、声道数、码率、帧大小等
+     */
+    struct Mp3FrameInfo
+    {
+        int sampleRate;
+        int channels;
+        int bitrate;   // kbps
+        int frameSize; // 字节
+        bool valid;
+    };
+
+    // MP3相关辅助函数的声明
+    static bool IsMp3File(HANDLE hFile);
+    static Mp3FrameInfo ParseMp3Frame(const uint8_t *data, size_t dataSize);
+    static size_t SkipId3Tags(HANDLE hFile);
+    static StandardWavInfo DecodeMp3ToStandard(HANDLE hFile);
+
+    /**
      * @brief 预加载音频信息结构体
      *
      * 存储重采样后的标准格式音频数据，作为共享数据源
@@ -101,6 +122,9 @@ namespace
     {
         StandardWavInfo data;          // 重采样后的音频数据（44.1kHz, 双声道, 16位）
         bool markedForRemoval = false; // 标记为待删除（播放结束后清理）
+        bool loadFailed = false;       // 加载是否失败
+        std::wstring errorMsg;         // 加载失败时的错误信息
+        std::shared_ptr<yumo::readySign> readyFlag; // 加载完成标志（内部使用）
     };
 
     /**
@@ -252,8 +276,8 @@ namespace
         AudioPool &operator=(const AudioPool &) = delete;
 
     private:
-        AudioPool() = default;
-        ~AudioPool() = default;
+        AudioPool();
+        ~AudioPool();
 
         size_t allocateInstanceId();
 
@@ -264,6 +288,10 @@ namespace
         mutable std::mutex mutex_;
         bool isPlaying_ = false;
         HWAVEOUT hWaveOut_ = nullptr;
+        std::atomic<bool> shuttingDown_{false};
+
+        std::vector<std::thread> loadThreads_;
+        std::mutex loadThreadsMutex_;
 
         static const size_t BUFFER_COUNT = 2;
 
@@ -277,12 +305,40 @@ namespace
     // 前向声明（内部使用的辅助函数）
     StandardWavInfo convertToStandard(const WavInfo &wavInfo);
     void loadWav(const wchar_t *filename, WavInfo *out);
+    StandardWavInfo loadAudio(const wchar_t *filename);
 
     // 音频缓冲区大小（约100ms的音频）
     // 计算：采样率 * 声道数 * 时长(秒) = 44100 * 2 * 0.1 = 8820 个样本
     const size_t AUDIO_CHUNK_SIZE = static_cast<size_t>(44100 * 2 * 0.1);
 
     // AudioPool 单例实现
+    AudioPool::AudioPool() = default;
+
+    AudioPool::~AudioPool()
+    {
+        shuttingDown_ = true;
+
+        // 等待所有加载线程完成（先关设备，再等线程）
+        // 关闭音频设备（先重置再关闭，确保所有缓冲区被正确返回）
+        if (hWaveOut_)
+        {
+            waveOutReset(hWaveOut_);
+            waveOutClose(hWaveOut_);
+            hWaveOut_ = nullptr;
+        }
+
+        // 等待所有加载线程完成
+        {
+            std::lock_guard<std::mutex> lock(loadThreadsMutex_);
+            for (auto &t : loadThreads_)
+            {
+                if (t.joinable())
+                    t.join();
+            }
+            loadThreads_.clear();
+        }
+    }
+
     AudioPool &AudioPool::getInstance()
     {
         static AudioPool instance;
@@ -292,9 +348,13 @@ namespace
     // 预加载音频文件（异步）
     size_t AudioPool::preloadAudio(const wchar_t *filename, yumo::readySign *ready)
     {
-        auto readyPtr = ready
+        // 创建内部就绪标志（由 PreloadedAudio 持有，线程安全）
+        auto internalReady = std::make_shared<yumo::readySign>(false);
+
+        // 用户的 ready 指针（用 shared_ptr 包装，无删除器）
+        auto userReady = ready
                             ? std::shared_ptr<yumo::readySign>(ready, [](yumo::readySign *) {})
-                            : std::make_shared<yumo::readySign>(false);
+                            : nullptr;
 
         if (ready)
         {
@@ -306,27 +366,106 @@ namespace
             std::lock_guard<std::mutex> lock(mutex_);
             preloadedAudios_.push_back(std::make_unique<PreloadedAudio>());
             preloadedId = preloadedAudios_.size() - 1;
+            preloadedAudios_[preloadedId]->readyFlag = internalReady;
         }
 
-        std::thread loadThread([this, filename, preloadedId, readyPtr]()
-                               {
-            try {
-                WavInfo wavInfo;
-                loadWav(filename, &wavInfo);
+        // 清理已完成的加载线程
+        {
+            std::lock_guard<std::mutex> lock(loadThreadsMutex_);
+            auto it = loadThreads_.begin();
+            while (it != loadThreads_.end())
+            {
+                if (it->joinable())
+                {
+                    // 尝试检查是否完成（非阻塞：尝试join会阻塞，所以我们只清理已joinable的）
+                    // 简单策略：保留所有线程，在析构时统一join
+                    ++it;
+                }
+                else
+                {
+                    it = loadThreads_.erase(it);
+                }
+            }
+        }
 
-                StandardWavInfo standardData = convertToStandard(wavInfo);
+        std::thread loadThread([this, filename, preloadedId, internalReady, userReady]()
+                               {
+            if (shuttingDown_)
+            {
+                *internalReady = true;
+                return;
+            }
+
+            try {
+                StandardWavInfo standardData = loadAudio(filename);
+
+                if (shuttingDown_)
+                {
+                    *internalReady = true;
+                    return;
+                }
 
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    preloadedAudios_[preloadedId]->data = std::move(standardData);
+                    if (preloadedId < preloadedAudios_.size())
+                    {
+                        preloadedAudios_[preloadedId]->data = std::move(standardData);
+                    }
                 }
-
-                *readyPtr = true;
+            } catch (const yumo::exception_ex2 &e) {
+                if (!shuttingDown_)
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (preloadedId < preloadedAudios_.size())
+                    {
+                        preloadedAudios_[preloadedId]->loadFailed = true;
+                        preloadedAudios_[preloadedId]->errorMsg = e.what();
+                    }
+                }
+            } catch (const yumo::exception_ex &e) {
+                if (!shuttingDown_)
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (preloadedId < preloadedAudios_.size())
+                    {
+                        preloadedAudios_[preloadedId]->loadFailed = true;
+                        preloadedAudios_[preloadedId]->errorMsg = e.what();
+                    }
+                }
+            } catch (const std::exception &e) {
+                if (!shuttingDown_)
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (preloadedId < preloadedAudios_.size())
+                    {
+                        preloadedAudios_[preloadedId]->loadFailed = true;
+                        preloadedAudios_[preloadedId]->errorMsg = L"加载失败";
+                    }
+                }
             } catch (...) {
-                *readyPtr = true;
-            } });
+                if (!shuttingDown_)
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (preloadedId < preloadedAudios_.size())
+                    {
+                        preloadedAudios_[preloadedId]->loadFailed = true;
+                        preloadedAudios_[preloadedId]->errorMsg = L"未知错误";
+                    }
+                }
+            }
 
-        loadThread.detach();
+            *internalReady = true;
+            if (userReady)
+            {
+                *userReady = true;
+            }
+        });
+
+        // 存储线程而非 detach，确保在析构时线程会被 join
+        {
+            std::lock_guard<std::mutex> lock(loadThreadsMutex_);
+            loadThreads_.push_back(std::move(loadThread));
+        }
 
         return preloadedId;
     }
@@ -351,6 +490,15 @@ namespace
         if (preloadedId >= preloadedAudios_.size())
             throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"无效的预加载音频ID");
 
+        // 检查加载是否失败
+        if (preloadedAudios_[preloadedId]->loadFailed) {
+            std::wstring errMsg = preloadedAudios_[preloadedId]->errorMsg;
+            lock.unlock();
+            throw yumo::exception_ex2(
+                yumo::exception::type::InvalidInput,
+                errMsg);
+        }
+
         // 检查数据是否已加载
         if (preloadedAudios_[preloadedId]->data.empty())
             throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"预加载音频数据为空");
@@ -367,8 +515,8 @@ namespace
         size_t instanceId = allocateInstanceId();
         playInstances_[instanceId] = instance;
 
-        // 如果设备未打开，则打开
-        if (!hWaveOut_)
+        // 如果设备未打开或已空闲，则启动/重启播放
+        if (!hWaveOut_ || !isPlaying_)
         {
             lock.unlock();
             ensureDeviceOpen();
@@ -376,59 +524,88 @@ namespace
 
         return instanceId;
     }
-
     // 添加音频文件并立即播放（便利接口）
     void AudioPool::addAudio(const wchar_t *filename, float volume, size_t *instanceId, yumo::readySign *ready)
     {
-        auto readyPtr = std::make_shared<yumo::readySign>(false);
+        auto readyInternal = std::make_shared<yumo::readySign>(false);
 
         if (ready)
         {
             *ready = false;
         }
 
-        size_t preloadedId = preloadAudio(filename, readyPtr.get());
+        size_t preloadedId = preloadAudio(filename, readyInternal.get());
 
-        std::thread([this, preloadedId, readyPtr, instanceId, ready, volume]()
-                    {
-            while (!readyPtr->load()) {
+        auto userReady = ready
+                            ? std::shared_ptr<yumo::readySign>(ready, [](yumo::readySign *) {})
+                            : nullptr;
+
+        std::thread addThread([this, preloadedId, readyInternal, userReady, instanceId, volume]()
+                              {
+            if (shuttingDown_)
+            {
+                if (userReady) *userReady = true;
+                return;
+            }
+
+            // 等待预加载完成
+            while (!readyInternal->load())
+            {
+                if (shuttingDown_)
+                {
+                    if (userReady) *userReady = true;
+                    return;
+                }
                 Sleep(10);
             }
 
+            if (shuttingDown_)
+            {
+                if (userReady) *userReady = true;
+                return;
+            }
+
+            // 检查加载是否失败
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                if (preloadedId >= preloadedAudios_.size() || preloadedAudios_[preloadedId]->data.empty()) {
-                    if (ready){
-						ready->store(true);
-					}
-					if (preloadedId < preloadedAudios_.size()) {
+                if (preloadedId >= preloadedAudios_.size() || 
+                    preloadedAudios_[preloadedId]->data.empty() ||
+                    preloadedAudios_[preloadedId]->loadFailed)
+                {
+                    if (preloadedId < preloadedAudios_.size())
+                    {
                         preloadedAudios_[preloadedId]->markedForRemoval = true;
                     }
+                    if (userReady) *userReady = true;
                     return;
                 }
             }
 
             try {
                 size_t id = addAudio(preloadedId, volume);
-				if (instanceId){
-					*instanceId = id;
-				}
-				
+                if (instanceId)
+                {
+                    *instanceId = id;
+                }
+
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    if (preloadedId < preloadedAudios_.size()) {
+                    if (preloadedId < preloadedAudios_.size())
+                    {
                         preloadedAudios_[preloadedId]->markedForRemoval = true;
                     }
                 }
-				if (ready){
-					ready->store(true);
-				}
+                if (userReady) *userReady = true;
             } catch (...) {
-				if (ready){
-					ready->store(true);
-				}
-            } })
-            .detach();
+                if (userReady) *userReady = true;
+            }
+        });
+
+        // 存储线程，确保在析构时被 join
+        {
+            std::lock_guard<std::mutex> lock(loadThreadsMutex_);
+            loadThreads_.push_back(std::move(addThread));
+        }
     }
 
     // 移除预加载音频对象
@@ -565,18 +742,22 @@ namespace
         if (!pPool || !pHeader)
             return;
 
-        // 先释放已播放完的缓冲区
+        // 先释放已播放完的缓冲区（总是安全的，即使设备已关闭）
         waveOutUnprepareHeader(hwo, pHeader, sizeof(WAVEHDR));
         delete[] pHeader->lpData;
         delete pHeader;
+
+        // 如果正在关闭，不再提交新的缓冲区
+        if (pPool->shuttingDown_)
+            return;
 
         // 检查是否所有音频都播放完毕
         bool allFinished = true;
         {
             std::lock_guard<std::mutex> lock(pPool->mutex_);
-            if (!pPool->isPlaying_)
+            if (!pPool->isPlaying_ || pPool->shuttingDown_)
             {
-                return; // 已停止播放
+                return; // 已停止或正在关闭
             }
             // 如果有激活的实例还没播完，就继续
             for (const auto &inst : pPool->playInstances_)
@@ -612,38 +793,92 @@ namespace
 
         if (allFinished)
         {
-            // 所有音频播放完毕，关闭设备
-            std::lock_guard<std::mutex> lock(pPool->mutex_);
-            pPool->isPlaying_ = false;
-            waveOutClose(hwo);
-            pPool->hWaveOut_ = nullptr;
-            return;
+            // 所有音频播放完毕，但保持设备播放静音，避免设备进入空闲状态
+            // 设备空闲后重启播放会导致问题，因此用静音缓冲区保持设备活跃
+            // isPlaying_ 保持为 true，回调继续提交静音缓冲区
         }
+
+        // 如果正在关闭，不再提交新的缓冲区
+        if (pPool->shuttingDown_)
+            return;
 
         // 准备新的数据
         int16_t *pData = new int16_t[AUDIO_CHUNK_SIZE];
         pPool->mixAudioChunk(pData, AUDIO_CHUNK_SIZE);
+
+        // 再次检查是否在关闭期间
+        if (pPool->shuttingDown_)
+        {
+            delete[] pData;
+            return;
+        }
 
         WAVEHDR *pNewHeader = new WAVEHDR;
         memset(pNewHeader, 0, sizeof(WAVEHDR));
         pNewHeader->lpData = reinterpret_cast<LPSTR>(pData);
         pNewHeader->dwBufferLength = static_cast<DWORD>(AUDIO_CHUNK_SIZE * sizeof(int16_t));
 
-        waveOutPrepareHeader(hwo, pNewHeader, sizeof(WAVEHDR));
-        waveOutWrite(hwo, pNewHeader, sizeof(WAVEHDR));
+        MMRESULT prepResult = waveOutPrepareHeader(hwo, pNewHeader, sizeof(WAVEHDR));
+        if (prepResult != MMSYSERR_NOERROR)
+        {
+            delete[] pData;
+            delete pNewHeader;
+            std::lock_guard<std::mutex> lock(pPool->mutex_);
+            pPool->isPlaying_ = false;
+            return;
+        }
+
+        MMRESULT writeResult = waveOutWrite(hwo, pNewHeader, sizeof(WAVEHDR));
+        if (writeResult != MMSYSERR_NOERROR)
+        {
+            waveOutUnprepareHeader(hwo, pNewHeader, sizeof(WAVEHDR));
+            delete[] pData;
+            delete pNewHeader;
+            std::lock_guard<std::mutex> lock(pPool->mutex_);
+            pPool->isPlaying_ = false;
+            return;
+        }
     }
 
-    // 确保音频设备已打开
+    // 确保音频设备已打开并正在播放
     void AudioPool::ensureDeviceOpen()
     {
         std::unique_lock<std::mutex> lock(mutex_);
 
-        if (hWaveOut_)
+        if (shuttingDown_)
             return;
 
         if (playInstances_.empty())
             return;
 
+        // 设备已打开且正在播放，无需操作
+        if (hWaveOut_ && isPlaying_)
+            return;
+
+        // 设备已打开但空闲（之前的音频播放完毕），重启播放
+        if (hWaveOut_ && !isPlaying_)
+        {
+            isPlaying_ = true;
+            lock.unlock();
+
+            // 提交初始缓冲区重启播放
+            for (size_t i = 0; i < BUFFER_COUNT; ++i)
+            {
+                int16_t *pData = new int16_t[AUDIO_CHUNK_SIZE];
+                mixAudioChunk(pData, AUDIO_CHUNK_SIZE);
+
+                WAVEHDR *pHeader = new WAVEHDR;
+                memset(pHeader, 0, sizeof(WAVEHDR));
+                pHeader->lpData = reinterpret_cast<LPSTR>(pData);
+                pHeader->dwBufferLength = static_cast<DWORD>(AUDIO_CHUNK_SIZE * sizeof(int16_t));
+
+                waveOutPrepareHeader(hWaveOut_, pHeader, sizeof(WAVEHDR));
+                waveOutWrite(hWaveOut_, pHeader, sizeof(WAVEHDR));
+            }
+            return;
+        }
+
+        // 设备未打开，需要打开
         // 只重置还在播放的实例的位置（position < data.size()）
         // 已播放完毕的实例不重置，让它们保持结束状态
         for (auto &inst : playInstances_)
@@ -667,6 +902,9 @@ namespace
 
         lock.unlock();
 
+        if (shuttingDown_)
+            return;
+
         MMRESULT mmResult = waveOutOpen(&hWaveOut, WAVE_MAPPER, &wf,
                                         reinterpret_cast<DWORD_PTR>(waveOutCallback),
                                         reinterpret_cast<DWORD_PTR>(this), CALLBACK_FUNCTION);
@@ -677,6 +915,11 @@ namespace
         }
 
         lock.lock();
+        if (shuttingDown_)
+        {
+            waveOutClose(hWaveOut);
+            return;
+        }
         if (hWaveOut_)
         {
             waveOutClose(hWaveOut);
@@ -782,6 +1025,314 @@ namespace
         playInstances_.erase(it);
         freeInstanceIds_.push(instanceId);
         return true;
+    }
+
+    // MP3格式检测
+    // 先通过文件扩展名快速判断（大小写不敏感）
+    static bool HasMp3Extension(const wchar_t *filename)
+    {
+        if (!filename) return false;
+        const wchar_t *dot = wcsrchr(filename, L'.');
+        if (!dot) return false;
+        return _wcsicmp(dot, L".mp3") == 0;
+    }
+
+    // 通过文件签名判断是否为 MP3（需已排除 WAV）
+    static bool IsMp3File(HANDLE hFile)
+    {
+        uint8_t header[4];
+        DWORD bytesRead;
+        SetFilePointer(hFile, 0, NULL, FILE_BEGIN);
+        if (!ReadFile(hFile, header, 4, &bytesRead, NULL) || bytesRead != 4)
+            return false;
+
+        // ID3v2 标签
+        if (header[0] == 'I' && header[1] == 'D' && header[2] == '3')
+            return true;
+
+        // MP3 同步帧
+        if (header[0] == 0xFF && (header[1] & 0xE0) == 0xE0)
+            return true;
+
+        return false;
+    }
+
+    // 解析 MP3 帧头
+    static Mp3FrameInfo ParseMp3Frame(const uint8_t *data, size_t dataSize)
+    {
+        Mp3FrameInfo info = {0, 0, 0, 0, false};
+
+        for (size_t i = 0; i + 4 <= dataSize; ++i)
+        {
+            if (data[i] == 0xFF && (data[i + 1] & 0xE0) == 0xE0)
+            {
+                uint8_t version = (data[i + 1] >> 3) & 0x03;
+                uint8_t layer = (data[i + 1] >> 1) & 0x03;
+                uint8_t bitrateIdx = (data[i + 2] >> 4) & 0x0F;
+                uint8_t sampleIdx = (data[i + 2] >> 2) & 0x03;
+                uint8_t channelMode = (data[i + 3] >> 6) & 0x03;
+
+                // MPEG 音频层：00=保留, 01=Layer III(MP3), 10=Layer II, 11=Layer I
+                if (version <= 3 && layer == 1)
+                {
+                    static const int sampleRates[4][3] = {
+                        {44100, 48000, 32000},
+                        {22050, 24000, 16000},
+                        {11025, 12000, 8000},
+                        {0, 0, 0}};
+                    // MPEG1 Layer3: {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0}
+                    // MPEG2 Layer3: {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0}
+                    static const int bitrates[2][16] = {
+                        {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0},
+                        {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0}};
+
+                    int idx = (version == 3) ? 0 : 1;
+                    int rate = sampleRates[idx][sampleIdx];
+                    int br = bitrates[idx][bitrateIdx];
+                    if (rate == 0 || br == 0)
+                        continue;
+
+                    int channels = (channelMode == 3) ? 1 : 2;
+                    int padding = (data[i + 2] >> 1) & 0x01;
+                    int frameSize;
+                    if (version == 3)
+                        frameSize = 144 * br * 1000 / rate + padding;
+                    else
+                        frameSize = 72 * br * 1000 / rate + padding;
+
+                    info.sampleRate = rate;
+                    info.channels = channels;
+                    info.bitrate = br;
+                    info.frameSize = frameSize;
+                    info.valid = true;
+                    break;
+                }
+            }
+        }
+        return info;
+    }
+
+    // 跳过 ID3v2 标签，返回数据起始偏移
+    static size_t SkipId3Tags(HANDLE hFile)
+    {
+        uint8_t header[10];
+        DWORD bytesRead;
+        SetFilePointer(hFile, 0, NULL, FILE_BEGIN);
+        if (!ReadFile(hFile, header, 10, &bytesRead, NULL) || bytesRead != 10)
+            return 0;
+
+        if (header[0] == 'I' && header[1] == 'D' && header[2] == '3')
+        {
+            size_t size = ((header[6] & 0x7F) << 21) |
+                          ((header[7] & 0x7F) << 14) |
+                          ((header[8] & 0x7F) << 7) |
+                          (header[9] & 0x7F);
+            return size + 10;
+        }
+        return 0;
+    }
+
+    /**
+     * @brief 使用Windows ACM将MP3解码为标准格式 (44.1kHz 16位立体声)
+     *
+     * 该函数通过Windows ACM（音频压缩管理器）将MP3文件解码为44.1kHz采样率、16位深度、立体声通道的WAV格式。
+     * 它会跳过ID3v2标签（如果存在），并返回解码后的音频数据。
+     *
+     * @param hFile 已打开的MP3文件句柄
+     * @return StandardWavInfo 包含解码后的音频数据的向量
+     * @throws yumo::exception_ex 若解码过程中发生错误（如文件读取失败、MP3格式无效等）
+     */
+    static StandardWavInfo DecodeMp3ToStandard(HANDLE hFile)
+    {
+        DWORD fileSize = GetFileSize(hFile, NULL);
+        if (fileSize == INVALID_FILE_SIZE)
+            throw yumo::exception_ex(yumo::exception::type::FileReadError, L"获取 MP3 文件大小失败");
+
+        if (fileSize < 4)
+            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"MP3 文件太小");
+
+        size_t skip = SkipId3Tags(hFile);
+        SetFilePointer(hFile, skip, NULL, FILE_BEGIN);
+        DWORD dataSize = fileSize - static_cast<DWORD>(skip);
+
+        if (dataSize < 4)
+            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"MP3 音频数据为空");
+
+        std::vector<uint8_t> mp3Data(dataSize);
+        DWORD bytesRead;
+        if (!ReadFile(hFile, mp3Data.data(), dataSize, &bytesRead, NULL) || bytesRead != dataSize)
+            throw yumo::exception_ex(yumo::exception::type::FileReadError, L"读取 MP3 数据失败");
+
+        Mp3FrameInfo frameInfo = ParseMp3Frame(mp3Data.data(), dataSize);
+        if (!frameInfo.valid)
+            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"无法解析 MP3 帧头");
+
+        // 验证帧信息的合理性
+        if (frameInfo.frameSize > 1024 * 1024)
+            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"MP3 帧大小异常");
+
+        if (frameInfo.sampleRate == 0 || frameInfo.sampleRate > 384000)
+            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"MP3 采样率异常");
+
+        if (frameInfo.channels != 1 && frameInfo.channels != 2)
+            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"MP3 声道数异常");
+
+        // 构造 MP3 源格式
+        MPEGLAYER3WAVEFORMAT srcFmt = {};
+        srcFmt.wfx.wFormatTag = WAVE_FORMAT_MPEGLAYER3;
+        srcFmt.wfx.nChannels = frameInfo.channels;
+        srcFmt.wfx.nSamplesPerSec = frameInfo.sampleRate;
+        srcFmt.wfx.nAvgBytesPerSec = (frameInfo.bitrate * 1000) / 8;
+        srcFmt.wfx.nBlockAlign = 1;
+        srcFmt.wfx.wBitsPerSample = 0;
+        srcFmt.wfx.cbSize = sizeof(MPEGLAYER3WAVEFORMAT) - sizeof(WAVEFORMATEX);
+        srcFmt.wID = MPEGLAYER3_ID_MPEG;
+        srcFmt.fdwFlags = 0;
+        srcFmt.nBlockSize = frameInfo.frameSize;
+        srcFmt.nFramesPerBlock = 1;
+        srcFmt.nCodecDelay = 0;
+
+        // 目标格式：使用与源相同的采样率（MP3 解码器通常不执行重采样）
+        // 统一输出为 16 位立体声 PCM
+        WAVEFORMATEX dstFmt = {};
+        dstFmt.wFormatTag = WAVE_FORMAT_PCM;
+        dstFmt.nChannels = 2;
+        dstFmt.nSamplesPerSec = frameInfo.sampleRate;
+        dstFmt.wBitsPerSample = 16;
+        dstFmt.nBlockAlign = dstFmt.nChannels * dstFmt.wBitsPerSample / 8;
+        dstFmt.nAvgBytesPerSec = dstFmt.nSamplesPerSec * dstFmt.nBlockAlign;
+        dstFmt.cbSize = 0;
+
+        // 打开 ACM 流进行 MP3 → PCM 解码
+        HACMSTREAM hStream = NULL;
+        MMRESULT mmr = acmStreamOpen(&hStream, NULL, &srcFmt.wfx, &dstFmt, NULL, 0, 0, 0);
+        
+        if (mmr != MMSYSERR_NOERROR)
+        {
+            std::wstring msg = L"ACM MP3 解码器不支持此格式 (error=" + std::to_wstring(mmr) + 
+                               L", sr=" + std::to_wstring(frameInfo.sampleRate) + 
+                               L", br=" + std::to_wstring(frameInfo.bitrate) + L")";
+            throw yumo::exception_ex2(yumo::exception::type::UnknownError, msg);
+        }
+
+        DWORD dstSize = 0;
+        mmr = acmStreamSize(hStream, dataSize, &dstSize, ACM_STREAMSIZEF_SOURCE);
+        if (mmr != MMSYSERR_NOERROR)
+        {
+            acmStreamClose(hStream, 0);
+            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"ACM 大小计算失败");
+        }
+
+        std::vector<uint8_t> dstBuffer(dstSize);
+        ACMSTREAMHEADER header = {};
+        header.cbStruct = sizeof(ACMSTREAMHEADER);
+        header.pbSrc = mp3Data.data();
+        header.cbSrcLength = dataSize;
+        header.pbDst = dstBuffer.data();
+        header.cbDstLength = dstSize;
+
+        mmr = acmStreamPrepareHeader(hStream, &header, 0);
+        if (mmr != MMSYSERR_NOERROR)
+        {
+            acmStreamClose(hStream, 0);
+            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"ACM 头准备失败");
+        }
+
+        // acmStreamPrepareHeader 可能修改缓冲区指针和长度，需重新设置
+        header.cbSrcLength = dataSize;
+        header.cbDstLengthUsed = 0;
+        mmr = acmStreamConvert(hStream, &header, ACM_STREAMCONVERTF_BLOCKALIGN);
+        if (mmr != MMSYSERR_NOERROR)
+        {
+            acmStreamUnprepareHeader(hStream, &header, 0);
+            acmStreamClose(hStream, 0);
+            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"MP3 转换失败");
+        }
+
+        acmStreamUnprepareHeader(hStream, &header, 0);
+        acmStreamClose(hStream, 0);
+
+        size_t decodedBytes = header.cbDstLengthUsed;
+
+        // 如果解码后的采样率不是 44100Hz，需要重采样到 44100Hz
+        if (frameInfo.sampleRate != 44100)
+        {
+            // 源格式：解码后的 PCM（原始采样率，16位，立体声）
+            WAVEFORMATEX srcPcmFmt = {};
+            srcPcmFmt.wFormatTag = WAVE_FORMAT_PCM;
+            srcPcmFmt.nChannels = 2;
+            srcPcmFmt.nSamplesPerSec = frameInfo.sampleRate;
+            srcPcmFmt.wBitsPerSample = 16;
+            srcPcmFmt.nBlockAlign = srcPcmFmt.nChannels * srcPcmFmt.wBitsPerSample / 8;
+            srcPcmFmt.nAvgBytesPerSec = srcPcmFmt.nSamplesPerSec * srcPcmFmt.nBlockAlign;
+            srcPcmFmt.cbSize = 0;
+
+            // 目标格式：44100Hz, 16位, 立体声 PCM
+            WAVEFORMATEX dstPcmFmt = {};
+            dstPcmFmt.wFormatTag = WAVE_FORMAT_PCM;
+            dstPcmFmt.nChannels = 2;
+            dstPcmFmt.nSamplesPerSec = 44100;
+            dstPcmFmt.wBitsPerSample = 16;
+            dstPcmFmt.nBlockAlign = dstPcmFmt.nChannels * dstPcmFmt.wBitsPerSample / 8;
+            dstPcmFmt.nAvgBytesPerSec = dstPcmFmt.nSamplesPerSec * dstPcmFmt.nBlockAlign;
+            dstPcmFmt.cbSize = 0;
+
+            HACMSTREAM hResample = NULL;
+            MMRESULT rmmr = acmStreamOpen(&hResample, NULL, &srcPcmFmt, &dstPcmFmt, NULL, 0, 0, 0);
+            if (rmmr != MMSYSERR_NOERROR)
+            {
+                std::wstring msg = L"ACM 重采样失败 (error=" + std::to_wstring(rmmr) + 
+                                   L", sr=" + std::to_wstring(frameInfo.sampleRate) + L")";
+                throw yumo::exception_ex2(yumo::exception::type::UnknownError, msg);
+            }
+
+            DWORD resampleDstSize = 0;
+            rmmr = acmStreamSize(hResample, static_cast<DWORD>(decodedBytes), &resampleDstSize, ACM_STREAMSIZEF_SOURCE);
+            if (rmmr != MMSYSERR_NOERROR)
+            {
+                acmStreamClose(hResample, 0);
+                throw yumo::exception_ex(yumo::exception::type::UnknownError, L"重采样大小计算失败");
+            }
+
+            std::vector<uint8_t> resampleBuffer(resampleDstSize);
+            ACMSTREAMHEADER rsHeader = {};
+            rsHeader.cbStruct = sizeof(ACMSTREAMHEADER);
+            rsHeader.pbSrc = dstBuffer.data();
+            rsHeader.cbSrcLength = static_cast<DWORD>(decodedBytes);
+            rsHeader.pbDst = resampleBuffer.data();
+            rsHeader.cbDstLength = resampleDstSize;
+
+            rmmr = acmStreamPrepareHeader(hResample, &rsHeader, 0);
+            if (rmmr != MMSYSERR_NOERROR)
+            {
+                acmStreamClose(hResample, 0);
+                throw yumo::exception_ex(yumo::exception::type::UnknownError, L"重采样头准备失败");
+            }
+
+            rsHeader.cbSrcLength = static_cast<DWORD>(decodedBytes);
+            rsHeader.cbDstLengthUsed = 0;
+            rmmr = acmStreamConvert(hResample, &rsHeader, ACM_STREAMCONVERTF_BLOCKALIGN);
+            if (rmmr != MMSYSERR_NOERROR)
+            {
+                acmStreamUnprepareHeader(hResample, &rsHeader, 0);
+                acmStreamClose(hResample, 0);
+                throw yumo::exception_ex(yumo::exception::type::UnknownError, L"重采样转换失败");
+            }
+
+            acmStreamUnprepareHeader(hResample, &rsHeader, 0);
+            acmStreamClose(hResample, 0);
+
+            size_t sampleCount = rsHeader.cbDstLengthUsed / sizeof(int16_t);
+            StandardWavInfo result(sampleCount);
+            memcpy(result.data(), resampleBuffer.data(), sampleCount * sizeof(int16_t));
+            return result;
+        }
+
+        // 采样率已经是 44100Hz，直接返回
+        size_t sampleCount = decodedBytes / sizeof(int16_t);
+        StandardWavInfo result(sampleCount);
+        memcpy(result.data(), dstBuffer.data(), sampleCount * sizeof(int16_t));
+        return result;
     }
 
     // 从磁盘加载WAV文件，解析其格式块和数据块，填充WavInfo结构体
@@ -913,13 +1464,75 @@ namespace
         out->valid = true; // 标记结构体有效
     }
 
-    // 使用 Windows ACM 进行音频转换
+    // 格式分发加载：根据文件类型选择合适的解码路径
+    StandardWavInfo loadAudio(const wchar_t *filename)
+    {
+        // 先通过扩展名快速判断
+        if (HasMp3Extension(filename))
+        {
+            resourceManager<HANDLE> fileHandler(
+                CreateFileW(filename, GENERIC_READ, FILE_SHARE_READ,
+                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL),
+                INVALID_HANDLE_VALUE,
+                [](HANDLE h) -> void
+                { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); });
+
+            if (fileHandler.get() == INVALID_HANDLE_VALUE)
+                throw yumo::exception_ex(
+                    yumo::exception::type::FileOpenError,
+                    L"MP3 文件打开失败");
+
+            // 二次验证：检查文件头是否确实是 MP3 格式
+            if (!IsMp3File(fileHandler.get()))
+                throw yumo::exception_ex(
+                    yumo::exception::type::InvalidInput,
+                    L"文件扩展名为 .mp3 但内容不是有效的 MP3 格式");
+
+            return DecodeMp3ToStandard(fileHandler.get());
+        }
+
+        // 默认走 WAV 路径（loadWav 内部会打开文件）
+        WavInfo wavInfo;
+        loadWav(filename, &wavInfo);
+        return convertToStandard(wavInfo);
+    }
+
+    // 使用Windows ACM进行音频转换
     StandardWavInfo convertToStandard(const WavInfo &wavInfo)
     {
         // 检查WAV文件是否有效
         if (!wavInfo.valid)
         {
             throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"WAV文件格式无效");
+        }
+
+        // 检查数据有效性
+        if (!wavInfo.pcmData || wavInfo.dataSize == 0)
+        {
+            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"WAV文件无音频数据");
+        }
+
+        // 检查参数合理性
+        if (wavInfo.wf.nSamplesPerSec == 0 || wavInfo.wf.nSamplesPerSec > 384000)
+        {
+            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"WAV采样率异常");
+        }
+
+        if (wavInfo.wf.nChannels == 0 || wavInfo.wf.nChannels > 8)
+        {
+            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"WAV声道数异常");
+        }
+
+        // 快速路径：已是目标格式则直接复制
+        if (wavInfo.wf.wFormatTag == WAVE_FORMAT_PCM &&
+            wavInfo.wf.nSamplesPerSec == 44100 &&
+            wavInfo.wf.nChannels == 2 &&
+            wavInfo.wf.wBitsPerSample == 16)
+        {
+            size_t sampleCount = wavInfo.dataSize / sizeof(int16_t);
+            StandardWavInfo result(sampleCount);
+            memcpy(result.data(), wavInfo.pcmData.get(), sampleCount * sizeof(int16_t));
+            return result;
         }
 
         const int sourceSampleRate = wavInfo.wf.nSamplesPerSec;
@@ -1028,7 +1641,7 @@ namespace
         const size_t outputSamples = outputBytes / sizeof(int16_t);
         StandardWavInfo result;
         result.resize(outputSamples);
-        memcpy(result.data(), destBuffer.get(), outputBytes);
+        memcpy(result.data(), destBuffer.get(), outputSamples * sizeof(int16_t));
 
         return result;
     }

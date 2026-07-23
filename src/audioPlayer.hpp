@@ -134,7 +134,7 @@ namespace yumo
     /**
      * @brief 预加载音频
      *
-     * @param[in] filename 音频文件路径
+     * @param[in] filename 音频文件路径（目前支持WAV、MP3格式）
      * @param[out] ready 可选的加载状态标记，按地址传递，调用时自动被设为false，加载完成后变为true
      * @return 预加载音频ID
      */
@@ -152,7 +152,7 @@ namespace yumo
      * 简化用法，内部自动完成异步预加载和添加播放。
      * 播放完成后自动移除预加载对象。
      *
-     * @param[in] filename WAV文件路径
+     * @param[in] filename 音频文件路径（目前支持WAV、MP3格式）
      * @param[in] volume 音量，最小0.0，最大1.0，默认为 1.0
      * @param[out] instanceId 可选的播放实例ID输出，音频播放开始后写入
      * @param[out] ready 可选的加载状态标记，按地址传递，调用时自动被设为false，加载完成后变为true
