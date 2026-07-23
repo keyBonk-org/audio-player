@@ -4,7 +4,6 @@
 #include <iostream>
 #include <io.h>
 #include <fcntl.h>
-#include <atomic>
 #include <string>
 
 struct AudioStatus
@@ -321,6 +320,11 @@ int main()
             }
             }
         } while (choice != 10);
+    }
+    catch (const yumo::exception_ex2 &e)
+    {
+        std::wcerr << L"错误: " << e.what() << std::endl;
+        return 1;
     }
     catch (const yumo::exception_ex &e)
     {
