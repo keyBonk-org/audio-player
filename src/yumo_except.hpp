@@ -30,12 +30,19 @@ namespace yumo
             FileReadError,  // 文件读取失败
             FileWriteError, // 文件写入失败
             FileCloseError, // 文件关闭失败
+            FileCorrupted,  // 文件损坏
             FileError,      // 文件相关错误
 
             //  参数与状态错误
             InvalidInput,  // 输入参数无效
             InvalidFormat, // 输入数据格式错误
-            InvalidState,  // 当前状态不允许执行该操作
+            InvalidID,     // 输入ID无效
+            InvalidData,   // 数据无效（空数据、损坏数据等）
+            InvalidState,  // 当前状态不允许执行该操作（用户设置冲突）
+
+            // 音频播放与解码错误
+            PlaybackError, // 音频播放失败
+            DecodeError,   // 音频解码失败
 
             // 内存错误
             OutOfMemory, // 内存不足

@@ -69,6 +69,32 @@ namespace
     const size_t MAXIMUM_FMT_SIZE = 24;                  // 最大fmt块大小（包含所有可选字段）
     const size_t COMMON_FMT_SIZE = sizeof(WAVEFORMATEX); // fmt块大小（包含所有字段）
 
+    // 将 MMRESULT 错误码转为可读字符串
+    static std::wstring MmErrorToString(MMRESULT mmr)
+    {
+        wchar_t buf[256] = {};
+        waveOutGetErrorTextW(mmr, buf, sizeof(buf) / sizeof(wchar_t));
+        return std::wstring(buf);
+    }
+
+    // 将 GetLastError() 转为可读字符串
+    static std::wstring WinErrorToString(DWORD errorCode)
+    {
+        if (errorCode == 0)
+            return L"无错误";
+
+        wchar_t buf[512] = {};
+        DWORD flags = FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
+        DWORD len = FormatMessageW(flags, NULL, errorCode, 0, buf, sizeof(buf) / sizeof(wchar_t), NULL);
+        if (len > 0)
+        {
+            while (len > 0 && (buf[len - 1] == L'\r' || buf[len - 1] == L'\n'))
+                buf[--len] = L'\0';
+            return std::wstring(buf);
+        }
+        return L"未知系统错误 (code=" + std::to_wstring(errorCode) + L")";
+    }
+
     /**
      * @brief WAV文件信息结构体
      *
@@ -240,26 +266,26 @@ namespace
          * @brief 停止指定播放实例
          *
          * @param instanceId 播放实例ID
-         * @return true=成功，false=无效ID
+         * @throws yumo::exception 无效ID
          */
-        bool stop(size_t instanceId);
+        void stop(size_t instanceId);
 
         /**
          * @brief 恢复指定播放实例
          *
          * @param instanceId 播放实例ID
-         * @return true=成功，false=无效ID
+         * @throws yumo::exception 无效ID
          */
-        bool resume(size_t instanceId);
+        void resume(size_t instanceId);
 
         /**
          * @brief 设置指定播放实例的静音状态
          *
          * @param instanceId 播放实例ID
          * @param muted true=静音，false=取消静音
-         * @return true=成功，false=无效ID
+         * @throws yumo::exception 无效ID
          */
-        bool setMuted(size_t instanceId, bool muted);
+        void setMuted(size_t instanceId, bool muted);
 
         /**
          * @brief 移除播放实例
@@ -267,9 +293,9 @@ namespace
          * 从播放队列中移除指定实例，释放其资源
          *
          * @param instanceId 播放实例ID
-         * @return true=成功，false=无效ID
+         * @throws yumo::exception 无效ID
          */
-        bool remove(size_t instanceId);
+        void remove(size_t instanceId);
 
         // 禁用拷贝构造和赋值
         AudioPool(const AudioPool &) = delete;
@@ -488,20 +514,20 @@ namespace
         std::unique_lock<std::mutex> lock(mutex_);
 
         if (preloadedId >= preloadedAudios_.size())
-            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"无效的预加载音频ID");
+            throw yumo::exception_ex(yumo::exception::type::InvalidID, L"无效的预加载音频ID");
 
         // 检查加载是否失败
         if (preloadedAudios_[preloadedId]->loadFailed) {
             std::wstring errMsg = preloadedAudios_[preloadedId]->errorMsg;
             lock.unlock();
             throw yumo::exception_ex2(
-                yumo::exception::type::InvalidInput,
-                errMsg);
+                yumo::exception::type::InvalidData,
+                L"预加载音频加载失败: " + errMsg);
         }
 
         // 检查数据是否已加载
         if (preloadedAudios_[preloadedId]->data.empty())
-            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"预加载音频数据为空");
+            throw yumo::exception_ex(yumo::exception::type::InvalidData, L"预加载音频数据为空");
 
         // 创建播放实例
         PlayInstance instance;
@@ -615,7 +641,7 @@ namespace
 
         if (preloadedId >= preloadedAudios_.size())
         {
-            return;
+            throw yumo::exception_ex(yumo::exception::type::InvalidID, L"无效的预加载音频ID");
         }
 
         // 检查是否有播放实例正在引用该预加载对象
@@ -661,7 +687,7 @@ namespace
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = playInstances_.find(instanceId);
         if (it == playInstances_.end())
-            return false;
+            throw yumo::exception_ex(yumo::exception::type::InvalidID, L"无效的播放实例ID");
         const auto &inst = it->second;
         return inst.active && inst.source && inst.position < inst.source->data.size();
     }
@@ -872,8 +898,26 @@ namespace
                 pHeader->lpData = reinterpret_cast<LPSTR>(pData);
                 pHeader->dwBufferLength = static_cast<DWORD>(AUDIO_CHUNK_SIZE * sizeof(int16_t));
 
-                waveOutPrepareHeader(hWaveOut_, pHeader, sizeof(WAVEHDR));
-                waveOutWrite(hWaveOut_, pHeader, sizeof(WAVEHDR));
+                MMRESULT prepResult = waveOutPrepareHeader(hWaveOut_, pHeader, sizeof(WAVEHDR));
+                if (prepResult != MMSYSERR_NOERROR)
+                {
+                    delete[] pData;
+                    delete pHeader;
+                    throw yumo::exception_ex2(
+                        yumo::exception::type::PlaybackError,
+                        L"播放失败: " + MmErrorToString(prepResult));
+                }
+
+                MMRESULT writeResult = waveOutWrite(hWaveOut_, pHeader, sizeof(WAVEHDR));
+                if (writeResult != MMSYSERR_NOERROR)
+                {
+                    waveOutUnprepareHeader(hWaveOut_, pHeader, sizeof(WAVEHDR));
+                    delete[] pData;
+                    delete pHeader;
+                    throw yumo::exception_ex2(
+                        yumo::exception::type::PlaybackError,
+                        L"播放失败: " + MmErrorToString(writeResult));
+                }
             }
             return;
         }
@@ -911,7 +955,9 @@ namespace
 
         if (mmResult != MMSYSERR_NOERROR)
         {
-            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"波形音频设备打开失败");
+            throw yumo::exception_ex2(
+                yumo::exception::type::PlaybackError,
+                L"播放失败: " + MmErrorToString(mmResult));
         }
 
         lock.lock();
@@ -941,8 +987,26 @@ namespace
             pHeader->lpData = reinterpret_cast<LPSTR>(pData);
             pHeader->dwBufferLength = static_cast<DWORD>(AUDIO_CHUNK_SIZE * sizeof(int16_t));
 
-            waveOutPrepareHeader(hWaveOut, pHeader, sizeof(WAVEHDR));
-            waveOutWrite(hWaveOut, pHeader, sizeof(WAVEHDR));
+            MMRESULT prepResult = waveOutPrepareHeader(hWaveOut, pHeader, sizeof(WAVEHDR));
+            if (prepResult != MMSYSERR_NOERROR)
+            {
+                delete[] pData;
+                delete pHeader;
+                throw yumo::exception_ex2(
+                    yumo::exception::type::PlaybackError,
+                    L"播放失败: " + MmErrorToString(prepResult));
+            }
+
+            MMRESULT writeResult = waveOutWrite(hWaveOut, pHeader, sizeof(WAVEHDR));
+            if (writeResult != MMSYSERR_NOERROR)
+            {
+                waveOutUnprepareHeader(hWaveOut, pHeader, sizeof(WAVEHDR));
+                delete[] pData;
+                delete pHeader;
+                throw yumo::exception_ex2(
+                    yumo::exception::type::PlaybackError,
+                    L"播放失败: " + MmErrorToString(writeResult));
+            }
         }
     }
 
@@ -962,7 +1026,7 @@ namespace
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = playInstances_.find(instanceId);
         if (it == playInstances_.end())
-            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"无效的播放实例ID");
+            throw yumo::exception_ex(yumo::exception::type::InvalidID, L"无效的播放实例ID");
 
         it->second.volume = std::max(0.0f, std::min(1.0f, volume));
     }
@@ -973,58 +1037,54 @@ namespace
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = playInstances_.find(instanceId);
         if (it == playInstances_.end())
-            throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"无效的播放实例ID");
+            throw yumo::exception_ex(yumo::exception::type::InvalidID, L"无效的播放实例ID");
 
         return it->second.volume;
     }
 
     // 停止指定播放实例
-    bool AudioPool::stop(size_t instanceId)
+    void AudioPool::stop(size_t instanceId)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = playInstances_.find(instanceId);
         if (it == playInstances_.end())
-            return false;
+            throw yumo::exception_ex(yumo::exception::type::InvalidID, L"无效的播放实例ID");
 
         it->second.stopped = true;
-        return true;
     }
 
     // 恢复指定播放实例
-    bool AudioPool::resume(size_t instanceId)
+    void AudioPool::resume(size_t instanceId)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = playInstances_.find(instanceId);
         if (it == playInstances_.end())
-            return false;
+            throw yumo::exception_ex(yumo::exception::type::InvalidID, L"无效的播放实例ID");
 
         it->second.stopped = false;
-        return true;
     }
 
     // 设置指定播放实例的静音状态
-    bool AudioPool::setMuted(size_t instanceId, bool muted)
+    void AudioPool::setMuted(size_t instanceId, bool muted)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = playInstances_.find(instanceId);
         if (it == playInstances_.end())
-            return false;
+            throw yumo::exception_ex(yumo::exception::type::InvalidID, L"无效的播放实例ID");
 
         it->second.muted = muted;
-        return true;
     }
 
     // 移除播放实例
-    bool AudioPool::remove(size_t instanceId)
+    void AudioPool::remove(size_t instanceId)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = playInstances_.find(instanceId);
         if (it == playInstances_.end())
-            return false;
+            throw yumo::exception_ex(yumo::exception::type::InvalidID, L"无效的播放实例ID");
 
         playInstances_.erase(it);
         freeInstanceIds_.push(instanceId);
-        return true;
     }
 
     // MP3格式检测
@@ -1152,7 +1212,13 @@ namespace
             throw yumo::exception_ex(yumo::exception::type::InvalidInput, L"MP3 文件太小");
 
         size_t skip = SkipId3Tags(hFile);
-        SetFilePointer(hFile, skip, NULL, FILE_BEGIN);
+        if (SetFilePointer(hFile, skip, NULL, FILE_BEGIN) == INVALID_SET_FILE_POINTER)
+        {
+            DWORD error = GetLastError();
+            throw yumo::exception_ex2(
+                yumo::exception::type::FileError,
+                L"文件读取失败: " + WinErrorToString(error));
+        }
         DWORD dataSize = fileSize - static_cast<DWORD>(skip);
 
         if (dataSize < 4)
@@ -1209,10 +1275,8 @@ namespace
         
         if (mmr != MMSYSERR_NOERROR)
         {
-            std::wstring msg = L"ACM MP3 解码器不支持此格式 (error=" + std::to_wstring(mmr) + 
-                               L", sr=" + std::to_wstring(frameInfo.sampleRate) + 
-                               L", br=" + std::to_wstring(frameInfo.bitrate) + L")";
-            throw yumo::exception_ex2(yumo::exception::type::UnknownError, msg);
+            std::wstring msg = L"解码失败: " + MmErrorToString(mmr);
+            throw yumo::exception_ex2(yumo::exception::type::DecodeError, msg);
         }
 
         DWORD dstSize = 0;
@@ -1220,7 +1284,8 @@ namespace
         if (mmr != MMSYSERR_NOERROR)
         {
             acmStreamClose(hStream, 0);
-            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"ACM 大小计算失败");
+            throw yumo::exception_ex2(yumo::exception::type::DecodeError,
+                L"解码失败: " + MmErrorToString(mmr));
         }
 
         std::vector<uint8_t> dstBuffer(dstSize);
@@ -1235,7 +1300,8 @@ namespace
         if (mmr != MMSYSERR_NOERROR)
         {
             acmStreamClose(hStream, 0);
-            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"ACM 头准备失败");
+            throw yumo::exception_ex2(yumo::exception::type::DecodeError,
+                L"解码失败: " + MmErrorToString(mmr));
         }
 
         // acmStreamPrepareHeader 可能修改缓冲区指针和长度，需重新设置
@@ -1246,7 +1312,8 @@ namespace
         {
             acmStreamUnprepareHeader(hStream, &header, 0);
             acmStreamClose(hStream, 0);
-            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"MP3 转换失败");
+            throw yumo::exception_ex2(yumo::exception::type::DecodeError,
+                L"解码失败: " + MmErrorToString(mmr));
         }
 
         acmStreamUnprepareHeader(hStream, &header, 0);
@@ -1281,9 +1348,8 @@ namespace
             MMRESULT rmmr = acmStreamOpen(&hResample, NULL, &srcPcmFmt, &dstPcmFmt, NULL, 0, 0, 0);
             if (rmmr != MMSYSERR_NOERROR)
             {
-                std::wstring msg = L"ACM 重采样失败 (error=" + std::to_wstring(rmmr) + 
-                                   L", sr=" + std::to_wstring(frameInfo.sampleRate) + L")";
-                throw yumo::exception_ex2(yumo::exception::type::UnknownError, msg);
+                std::wstring msg = L"解码失败: " + MmErrorToString(rmmr);
+                throw yumo::exception_ex2(yumo::exception::type::DecodeError, msg);
             }
 
             DWORD resampleDstSize = 0;
@@ -1291,7 +1357,8 @@ namespace
             if (rmmr != MMSYSERR_NOERROR)
             {
                 acmStreamClose(hResample, 0);
-                throw yumo::exception_ex(yumo::exception::type::UnknownError, L"重采样大小计算失败");
+                throw yumo::exception_ex2(yumo::exception::type::DecodeError,
+                    L"解码失败: " + MmErrorToString(rmmr));
             }
 
             std::vector<uint8_t> resampleBuffer(resampleDstSize);
@@ -1306,7 +1373,8 @@ namespace
             if (rmmr != MMSYSERR_NOERROR)
             {
                 acmStreamClose(hResample, 0);
-                throw yumo::exception_ex(yumo::exception::type::UnknownError, L"重采样头准备失败");
+                throw yumo::exception_ex2(yumo::exception::type::DecodeError,
+                    L"解码失败: " + MmErrorToString(rmmr));
             }
 
             rsHeader.cbSrcLength = static_cast<DWORD>(decodedBytes);
@@ -1316,7 +1384,8 @@ namespace
             {
                 acmStreamUnprepareHeader(hResample, &rsHeader, 0);
                 acmStreamClose(hResample, 0);
-                throw yumo::exception_ex(yumo::exception::type::UnknownError, L"重采样转换失败");
+                throw yumo::exception_ex2(yumo::exception::type::DecodeError,
+                    L"解码失败: " + MmErrorToString(rmmr));
             }
 
             acmStreamUnprepareHeader(hResample, &rsHeader, 0);
@@ -1347,9 +1416,12 @@ namespace
 
         // 文件打开失败
         if (fileHandler.get() == INVALID_HANDLE_VALUE)
-            throw yumo::exception_ex(
+        {
+            DWORD error = GetLastError();
+            throw yumo::exception_ex2(
                 yumo::exception::type::FileOpenError,
-                L"WAV文件打开失败，可能是文件不存在或其他错误");
+                L"WAV文件打开失败: " + WinErrorToString(error));
+        }
 
         DWORD riff, fileLenMinus8, wave;
         DWORD bytesRead;
@@ -1412,9 +1484,10 @@ namespace
                     {
                         if (SetFilePointer(fileHandler.get(), chunkSize - COMMON_FMT_SIZE, NULL, FILE_CURRENT) == INVALID_SET_FILE_POINTER)
                         {
-                            throw yumo::exception_ex(
-                                yumo::exception::type::FileReadError,
-                                L"WAV文件读取失败，可能是文件损坏或其他错误");
+                            DWORD error = GetLastError();
+                            throw yumo::exception_ex2(
+                                yumo::exception::type::FileError,
+                                L"文件读取失败: " + WinErrorToString(error));
                         }
                     }
                 }
@@ -1453,11 +1526,9 @@ namespace
                 if (SetFilePointer(fileHandler.get(), chunkSize, NULL, FILE_CURRENT) == INVALID_SET_FILE_POINTER)
                 {
                     DWORD error = GetLastError();
-                    // todo 利用这个错误码生成错误信息
-                    (void)error; // error 可用于日志记录
-                    throw yumo::exception_ex(
-                        yumo::exception::type::FileReadError,
-                        L"WAV文件读取失败，可能是文件损坏或其他错误");
+                    throw yumo::exception_ex2(
+                        yumo::exception::type::FileError,
+                        L"文件读取失败: " + WinErrorToString(error));
                 }
             }
         }
@@ -1478,9 +1549,12 @@ namespace
                 { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); });
 
             if (fileHandler.get() == INVALID_HANDLE_VALUE)
-                throw yumo::exception_ex(
+            {
+                DWORD error = GetLastError();
+                throw yumo::exception_ex2(
                     yumo::exception::type::FileOpenError,
-                    L"MP3 文件打开失败");
+                    L"MP3 文件打开失败: " + WinErrorToString(error));
+            }
 
             // 二次验证：检查文件头是否确实是 MP3 格式
             if (!IsMp3File(fileHandler.get()))
@@ -1577,7 +1651,8 @@ namespace
 
         if (mmResult != MMSYSERR_NOERROR)
         {
-            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"ACM流打开失败");
+            throw yumo::exception_ex2(yumo::exception::type::DecodeError,
+                L"解码失败: " + MmErrorToString(mmResult));
         }
 
         // 步骤4：计算目标缓冲区大小
@@ -1587,7 +1662,8 @@ namespace
         if (mmResult != MMSYSERR_NOERROR)
         {
             acmStreamClose(hAcmStream, 0);
-            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"无法计算目标缓冲区大小");
+            throw yumo::exception_ex2(yumo::exception::type::DecodeError,
+                L"解码失败: " + MmErrorToString(mmResult));
         }
 
         // 步骤5：准备转换头
@@ -1605,7 +1681,8 @@ namespace
         if (mmResult != MMSYSERR_NOERROR)
         {
             acmStreamClose(hAcmStream, 0);
-            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"ACM头准备失败");
+            throw yumo::exception_ex2(yumo::exception::type::DecodeError,
+                L"解码失败: " + MmErrorToString(mmResult));
         }
 
         // 步骤6：复制源数据
@@ -1619,7 +1696,8 @@ namespace
         {
             acmStreamUnprepareHeader(hAcmStream, &streamHeader, 0);
             acmStreamClose(hAcmStream, 0);
-            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"音频转换失败");
+            throw yumo::exception_ex2(yumo::exception::type::DecodeError,
+                L"解码失败: " + MmErrorToString(mmResult));
         }
 
         // 步骤8：清理ACM资源
@@ -1627,13 +1705,15 @@ namespace
         if (mmResult != MMSYSERR_NOERROR)
         {
             acmStreamClose(hAcmStream, 0);
-            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"ACM头清理失败");
+            throw yumo::exception_ex2(yumo::exception::type::DecodeError,
+                L"解码失败: " + MmErrorToString(mmResult));
         }
 
         mmResult = acmStreamClose(hAcmStream, 0);
         if (mmResult != MMSYSERR_NOERROR)
         {
-            throw yumo::exception_ex(yumo::exception::type::UnknownError, L"ACM流关闭失败");
+            throw yumo::exception_ex2(yumo::exception::type::DecodeError,
+                L"解码失败: " + MmErrorToString(mmResult));
         }
 
         // 步骤9：将转换后的数据转换为 StandardWavInfo (int16_t 双声道交织)
@@ -1699,23 +1779,23 @@ namespace yumo
         return AudioPool::getInstance().getVolume(instanceId);
     }
 
-    bool stop(size_t instanceId)
+    void stop(size_t instanceId)
     {
-        return AudioPool::getInstance().stop(instanceId);
+        AudioPool::getInstance().stop(instanceId);
     }
 
-    bool resume(size_t instanceId)
+    void resume(size_t instanceId)
     {
-        return AudioPool::getInstance().resume(instanceId);
+        AudioPool::getInstance().resume(instanceId);
     }
 
-    bool setMuted(size_t instanceId, bool muted)
+    void setMuted(size_t instanceId, bool muted)
     {
-        return AudioPool::getInstance().setMuted(instanceId, muted);
+        AudioPool::getInstance().setMuted(instanceId, muted);
     }
 
-    bool remove(size_t instanceId)
+    void remove(size_t instanceId)
     {
-        return AudioPool::getInstance().remove(instanceId);
+        AudioPool::getInstance().remove(instanceId);
     }
 }

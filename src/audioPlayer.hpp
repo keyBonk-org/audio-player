@@ -182,6 +182,7 @@ namespace yumo
      *
      * @param[in] instanceId 播放实例ID
      * @return 如果正在播放返回true，否则返回false
+     * @throws yumo::exception 无效的播放实例ID
      */
     bool isPlaying(size_t instanceId);
     /**
@@ -204,31 +205,31 @@ namespace yumo
      * @brief 停止指定播放实例
      *
      * @param[in] instanceId 播放实例ID
-     * @return true=成功，false=无效ID
+     * @throws yumo::exception 无效的播放实例ID
      */
-    bool stop(size_t instanceId);
+    void stop(size_t instanceId);
     /**
      * @brief 恢复指定播放实例
      *
      * @param[in] instanceId 播放实例ID
-     * @return true=成功，false=无效ID
+     * @throws yumo::exception 无效的播放实例ID
      */
-    bool resume(size_t instanceId);
+    void resume(size_t instanceId);
     /**
      * @brief 设置指定播放实例的静音状态
      *
      * @param[in] instanceId 播放实例ID
      * @param[in] muted true=静音，false=取消静音
-     * @return true=成功，false=无效ID
+     * @throws yumo::exception 无效的播放实例ID
      */
-    bool setMuted(size_t instanceId, bool muted);
+    void setMuted(size_t instanceId, bool muted);
     /**
      * @brief 从播放池中移除指定播放实例
      *
      * @param[in] instanceId 播放实例ID
-     * @return true=成功，false=无效ID
+     * @throws yumo::exception 无效的播放实例ID
      */
-    bool remove(size_t instanceId);
+    void remove(size_t instanceId);
 
 } // namespace yumo
 
