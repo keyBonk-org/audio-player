@@ -2,6 +2,7 @@
 #define AUDIO_PLAYER_HPP
 #include <atomic>
 #include <mutex>
+#include <memory>
 #include <functional>
 
 namespace yumo
@@ -133,33 +134,31 @@ namespace yumo
         {
         private:
             T *ptr_;
-            mutable std::mutex mutex_;
+            std::shared_ptr<std::mutex> mutex_;
 
         public:
-            proxy() : ptr_(nullptr) {}
-            proxy(T &value) : ptr_(&value) {}
-            proxy(T &&value) = delete;
-            proxy(const proxy &other) : ptr_(other.ptr_) {}
-            proxy &operator=(const proxy &other)
-            {
-                if (this != &other)
-                    ptr_ = other.ptr_;
-                return *this;
-            }
+            // todo 互斥锁nullptr
+            proxy() : ptr_(nullptr), mutex_(nullptr) {}
+            proxy(T &value) : ptr_(&value), mutex_(std::make_shared<std::mutex>()) {}
+            proxy(const proxy &other) : ptr_(other.ptr_), mutex_(other.mutex_) {}
+            proxy &operator=(const proxy &other) = delete;
             operator T() const
             {
-                std::lock_guard<std::mutex> lock(mutex_);
+                if (mutex_)
+                    std::lock_guard<std::mutex> lock(*mutex_);
                 return ptr_ ? *ptr_ : T();
             }
             proxy &operator=(T value)
             {
-                std::lock_guard<std::mutex> lock(mutex_);
+                if (mutex_)
+                    std::lock_guard<std::mutex> lock(*mutex_);
                 if (ptr_)
                     *ptr_ = value;
                 return *this;
             }
+            friend class audioInstance;
         };
-        size_t instanceId;        // 播放实例ID（按值传递）
+        const size_t instanceId;        // 播放实例ID（按值传递）
         proxy<size_t> position;   // 播放位置（采样点）
         proxy<float> volume;      // 音量（0.0-1.0）
         proxy<bool> active;       // 是否激活播放
@@ -168,6 +167,26 @@ namespace yumo
         audioInstance() : instanceId(0), position(), volume(), active(), stopped(), muted() {}
         audioInstance(size_t id, size_t &pos, float &vol, bool &active, bool &stop, bool &mute)
             : instanceId(id), position(pos), volume(vol), active(active), stopped(stop), muted(mute) {}
+        audioInstance(const audioInstance &other) 
+            : instanceId(other.instanceId), position(other.position), volume(other.volume), active(other.active), stopped(other.stopped), muted(other.muted) {}
+        // 用户层面上说，proxy = proxy 操作像是一个变量值赋到另一个变量（other隐式转换后触发self赋值操作）
+        // instance = instance 操作像是一个播放实例赋值另一个播放实例，也就是proxy所有权的转移
+        // 因此不给proxy重载赋值运算符，避免用户误以为是赋值操作
+        audioInstance &operator=(const audioInstance &other) {
+            if (this == &other) return *this;
+            const_cast<size_t &>(instanceId) = other.instanceId;
+            position.ptr_ = other.position.ptr_;
+            position.mutex_ = other.position.mutex_;
+            volume.ptr_ = other.volume.ptr_;
+            volume.mutex_ = other.volume.mutex_;
+            active.ptr_ = other.active.ptr_;
+            active.mutex_ = other.active.mutex_;
+            stopped.ptr_ = other.stopped.ptr_;
+            stopped.mutex_ = other.stopped.mutex_;
+            muted.ptr_ = other.muted.ptr_;
+            muted.mutex_ = other.muted.mutex_;
+            return *this;
+        }
     };
 
     /**
