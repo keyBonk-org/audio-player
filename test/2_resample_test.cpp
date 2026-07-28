@@ -29,10 +29,10 @@ void testAudioFile(const wchar_t* filename)
 
         yumo::global.stop = false;  // 重置停止状态，确保新音频能正常播放
      
-        size_t instanceId = yumo::addAudio(preloadedId);
+        yumo::audioInstance instance = yumo::addAudio(preloadedId);
         yumo::global.mute = false; // 取消静音开始播放
    
-        std::wcout << L"正在播放... 播放实例ID: " << instanceId << std::endl;
+        std::wcout << L"正在播放... 播放实例已创建" << std::endl;
         
         // 等待播放完成
         std::wcout << L"按 Enter 键停止...";
@@ -59,9 +59,9 @@ int main()
     
     // 测试三个音频文件
     const wchar_t* files[] = {
-        L"c:\\小狄\\audio-player\\test\\audio\\test.wav",
-        L"c:\\小狄\\audio-player\\test\\audio\\test2.wav", 
-        L"c:\\小狄\\audio-player\\test\\audio\\test3.wav"
+        L"..\\audio\\test.wav",
+        L"..\\audio\\test2.wav", 
+        L"..\\audio\\test3.wav"
     };
     
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); ++i)

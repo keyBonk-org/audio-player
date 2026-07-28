@@ -55,8 +55,8 @@ int main()
             std::this_thread::sleep_for(std::chrono::seconds(5));
 
             std::wcout << L"[第 " << (i + 1) << L" 次] 添加预加载音频 ID=" << preloadedIds[i] << L" 到播放池" << std::endl;
-            size_t instanceId = yumo::addAudio(preloadedIds[i]);
-            std::wcout << L"  -> 播放实例ID: " << instanceId << std::endl;
+            yumo::audioInstance instance = yumo::addAudio(preloadedIds[i]);
+            std::wcout << L"  -> 播放实例已创建" << std::endl;
             std::wcout << L"  当前播放实例数: " << yumo::getPlayingCount() << std::endl;
         }
 

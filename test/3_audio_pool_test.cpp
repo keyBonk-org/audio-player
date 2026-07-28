@@ -28,15 +28,15 @@ int main()
             L"..\\audio\\test3.wav"};
 
         std::wcout << L"\n使用 addAudio(filename) 字符串版本（便利接口，异步加载播放）..." << std::endl;
-        size_t instanceIds[3] = {0, 0, 0};
+        yumo::audioInstance instances[3];
         yumo::readySign readyFlags[3] = {false, false, false};
 
         for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); ++i)
         {
             std::wcout << L"\n添加音频: " << files[i] << std::endl;
             // 便利接口，异步加载并播放，播放完成后自动清理预加载对象
-            yumo::addAudio(files[i], 1.0f, &instanceIds[i], &readyFlags[i]);
-            std::wcout << L"  -> 后台加载播放，instanceId 将在播放开始后写入" << std::endl;
+            yumo::addAudio(files[i], 1.0f, &instances[i], &readyFlags[i]);
+            std::wcout << L"  -> 后台加载播放，instance 将在播放开始后写入" << std::endl;
         }
 
         std::wcout << L"\n等待所有音频加载完成..." << std::endl;
@@ -46,7 +46,7 @@ int main()
             {
                 Sleep(10);
             }
-            std::wcout << L"  音频 " << i << L" 加载完成，instanceId=" << instanceIds[i] << std::endl;
+            std::wcout << L"  音频 " << i << L" 加载完成，播放实例已创建" << std::endl;
         }
 
         std::wcout << L"\n所有音频已提交加载！" << std::endl;

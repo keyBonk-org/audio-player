@@ -1,6 +1,8 @@
 #ifndef AUDIO_PLAYER_HPP
 #define AUDIO_PLAYER_HPP
 #include <atomic>
+#include <mutex>
+#include <functional>
 
 namespace yumo
 {
@@ -122,6 +124,61 @@ namespace yumo
         volumeSign volume{1.0f}; // 音量（0.0-1.0）
     };
 
+    class audioInstance
+    {
+    public:
+        // 代理类，将指针隐藏为常规变量
+        template <typename T>
+        class proxy
+        {
+        private:
+            T *ptr_;
+            mutable std::mutex mutex_;
+
+        public:
+            proxy() : ptr_(nullptr) {}
+            proxy(T &value) : ptr_(&value) {}
+            proxy(T &&value) = delete;
+            proxy(const proxy &other) : ptr_(other.ptr_) {}
+            proxy &operator=(const proxy &other)
+            {
+                if (this != &other)
+                    ptr_ = other.ptr_;
+                return *this;
+            }
+            operator T() const
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                return ptr_ ? *ptr_ : T();
+            }
+            proxy &operator=(T value)
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (ptr_)
+                    *ptr_ = value;
+                return *this;
+            }
+        };
+        size_t instanceId;        // 播放实例ID（按值传递）
+        proxy<size_t> position;   // 播放位置（采样点）
+        proxy<float> volume;      // 音量（0.0-1.0）
+        proxy<bool> active;       // 是否激活播放
+        proxy<bool> stopped;      // 是否停止（挂起）
+        proxy<bool> muted;        // 是否静音（跳过混音但位置继续推进）
+        audioInstance() : instanceId(0), position(), volume(), active(), stopped(), muted() {}
+        audioInstance(size_t id, size_t &pos, float &vol, bool &active, bool &stop, bool &mute)
+            : instanceId(id), position(pos), volume(vol), active(active), stopped(stop), muted(mute) {}
+    };
+
+    /**
+     * @brief 播放完成回调类型
+     * 
+     * 当播放实例被自动回收时调用，通知用户该实例已失效
+     * 
+     * @param instanceId 被回收的播放实例ID
+     */
+    using PlaybackFinishedCallback = std::function<void(size_t instanceId)>;
+
     /**
      * @brief 全局音频控制信号实例
      *
@@ -143,9 +200,30 @@ namespace yumo
      * @brief 添加已预加载的音频到播放池并立即播放
      * @param[in] preloadedId 预加载音频ID
      * @param[in] volume 音量，最小0.0，最大1.0，默认为 1.0
-     * @return 播放实例ID
+     * @return 播放实例（包含instanceId）
      */
-    size_t addAudio(size_t preloadedId, float volume = 1.0f);
+    audioInstance addAudio(size_t preloadedId, float volume = 1.0f);
+    /**
+     * @brief 通过实例ID重新获取播放实例
+     * 
+     * 如果实例已被回收或不存在，返回无效的audioInstance（instanceId为0）
+     * 
+     * @param[in] instanceId 播放实例ID
+     * @return 播放实例，如果无效则instanceId为0
+     */
+    audioInstance regain(size_t instanceId);
+    /**
+     * @brief 注册播放完成回调
+     * 
+     * 当播放实例被自动回收时调用此回调
+     * 
+     * @param[in] callback 回调函数，参数为被回收的实例ID
+     */
+    void registerPlaybackFinishedCallback(PlaybackFinishedCallback callback);
+    /**
+     * @brief 注销播放完成回调
+     */
+    void unregisterPlaybackFinishedCallback();
     /**
      * @brief 添加未预加载的音频文件到播放池并立即播放
      *
@@ -154,10 +232,10 @@ namespace yumo
      *
      * @param[in] filename 音频文件路径（目前支持WAV、MP3格式）
      * @param[in] volume 音量，最小0.0，最大1.0，默认为 1.0
-     * @param[out] instanceId 可选的播放实例ID输出，音频播放开始后写入
+     * @param[out] instance 可选的播放实例输出，音频播放开始后写入
      * @param[out] ready 可选的加载状态标记，按地址传递，调用时自动被设为false，加载完成后变为true
      */
-    void addAudio(const wchar_t *filename, float volume = 1.0f, size_t *instanceId = nullptr, readySign *ready = nullptr);
+    void addAudio(const wchar_t *filename, float volume = 1.0f, yumo::audioInstance *instance = nullptr, yumo::readySign *ready = nullptr);
     /**
      * @brief 从预加载队列中移除预加载音频对象
      *
@@ -189,40 +267,6 @@ namespace yumo
      * @brief 重置所有播放实例的位置到开头
      */
     void resetAll();
-    /**
-     * @brief 设置指定播放实例的音量
-     * @param[in] instanceId 播放实例ID
-     * @param[in] volume 音量（0.0-1.0）
-     */
-    void setVolume(size_t instanceId, float volume);
-    /**
-     * @brief 获取指定播放实例的音量
-     * @param[in] instanceId 播放实例ID
-     * @return 音量（0.0-1.0）
-     */
-    float getVolume(size_t instanceId);
-    /**
-     * @brief 停止指定播放实例
-     *
-     * @param[in] instanceId 播放实例ID
-     * @throws yumo::exception 无效的播放实例ID
-     */
-    void stop(size_t instanceId);
-    /**
-     * @brief 恢复指定播放实例
-     *
-     * @param[in] instanceId 播放实例ID
-     * @throws yumo::exception 无效的播放实例ID
-     */
-    void resume(size_t instanceId);
-    /**
-     * @brief 设置指定播放实例的静音状态
-     *
-     * @param[in] instanceId 播放实例ID
-     * @param[in] muted true=静音，false=取消静音
-     * @throws yumo::exception 无效的播放实例ID
-     */
-    void setMuted(size_t instanceId, bool muted);
     /**
      * @brief 从播放池中移除指定播放实例
      *
