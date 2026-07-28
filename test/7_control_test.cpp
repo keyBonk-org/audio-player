@@ -9,7 +9,7 @@
 struct AudioStatus
 {
     size_t preloadedId;
-    size_t instanceId;
+    yumo::audioInstance instance;
     bool isPlaying;
     float volume;
     bool isMuted;
@@ -151,9 +151,9 @@ int main()
                     std::wcout << L"该音频已在播放中" << std::endl;
                     break;
                 }
-                audios[idx - 1].instanceId = yumo::addAudio(audios[idx - 1].preloadedId, audios[idx - 1].volume);
+                audios[idx - 1].instance = yumo::addAudio(audios[idx - 1].preloadedId, audios[idx - 1].volume);
                 audios[idx - 1].isPlaying = true;
-                std::wcout << L"开始播放音频 " << idx << L"，instanceId=" << audios[idx - 1].instanceId << std::endl;
+                std::wcout << L"开始播放音频 " << idx << L"，播放实例已创建" << std::endl;
                 break;
             }
             case 2:
@@ -183,7 +183,7 @@ int main()
                     std::wcout << L"音量必须在 0.0-1.0 之间" << std::endl;
                     break;
                 }
-                yumo::setVolume(audios[idx - 1].instanceId, vol);
+                audios[idx - 1].instance.volume = vol;
                 audios[idx - 1].volume = vol;
                 std::wcout << L"音量已设置为 " << vol << std::endl;
                 break;
@@ -210,7 +210,7 @@ int main()
                     std::wcout << L"该音频已暂停" << std::endl;
                     break;
                 }
-                yumo::stop(audios[idx - 1].instanceId);
+                audios[idx - 1].instance.stopped = true;
                 audios[idx - 1].isPaused = true;
                 std::wcout << L"已暂停音频 " << idx << std::endl;
                 break;
@@ -237,7 +237,7 @@ int main()
                     std::wcout << L"该音频未暂停" << std::endl;
                     break;
                 }
-                yumo::resume(audios[idx - 1].instanceId);
+                audios[idx - 1].instance.stopped = false;
                 audios[idx - 1].isPaused = false;
                 std::wcout << L"已恢复音频 " << idx << std::endl;
                 break;
@@ -260,7 +260,7 @@ int main()
                     break;
                 }
                 bool newMuted = !audios[idx - 1].isMuted;
-                yumo::setMuted(audios[idx - 1].instanceId, newMuted);
+                audios[idx - 1].instance.muted = newMuted;
                 audios[idx - 1].isMuted = newMuted;
                 std::wcout << L"音频 " << idx << (newMuted ? L"已静音" : L"取消静音") << std::endl;
                 break;

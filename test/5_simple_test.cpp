@@ -39,8 +39,8 @@ int main()
 
         // 添加播放
         std::wcout << L"添加播放..." << std::endl;
-        size_t instanceId = yumo::addAudio(preloadedId);
-        std::wcout << L"播放实例ID: " << instanceId << std::endl;
+        yumo::audioInstance instance = yumo::addAudio(preloadedId);
+        std::wcout << L"播放实例已创建" << std::endl;
         std::wcout << L"播放实例数: " << yumo::getPlayingCount() << std::endl;
 
         // 等待播放

@@ -146,10 +146,10 @@ namespace
      */
     struct PreloadedAudio
     {
-        StandardWavInfo data;          // 重采样后的音频数据（44.1kHz, 双声道, 16位）
-        bool markedForRemoval = false; // 标记为待删除（播放结束后清理）
-        bool loadFailed = false;       // 加载是否失败
-        std::wstring errorMsg;         // 加载失败时的错误信息
+        StandardWavInfo data;                       // 重采样后的音频数据（44.1kHz, 双声道, 16位）
+        bool markedForRemoval = false;              // 标记为待删除（播放结束后清理）
+        bool loadFailed = false;                    // 加载是否失败
+        std::wstring errorMsg;                      // 加载失败时的错误信息
         std::shared_ptr<yumo::readySign> readyFlag; // 加载完成标志（内部使用）
     };
 
@@ -202,9 +202,24 @@ namespace
          *
          * @param preloadedId preloadAudio 返回的预加载音频ID
          * @param volume 音量（0.0-1.0），默认为 1.0
-         * @return 播放实例ID
+         * @return 播放实例
          */
-        size_t addAudio(size_t preloadedId, float volume = 1.0f);
+        yumo::audioInstance addAudio(size_t preloadedId, float volume = 1.0f);
+
+        /**
+         * @brief 通过实例ID重新获取播放实例
+         */
+        yumo::audioInstance regain(size_t instanceId);
+
+        /**
+         * @brief 注册播放完成回调
+         */
+        void registerPlaybackFinishedCallback(yumo::PlaybackFinishedCallback callback);
+
+        /**
+         * @brief 注销播放完成回调
+         */
+        void unregisterPlaybackFinishedCallback();
 
         /**
          * @brief 添加音频文件到播放池并立即播放（便利接口）
@@ -214,10 +229,10 @@ namespace
          *
          * @param filename WAV文件路径
          * @param volume 音量（0.0-1.0），默认为 1.0
-         * @param instanceId 可选的播放实例ID输出（播放开始后写入）
+         * @param instance 可选的播放实例输出（播放开始后写入）
          * @param ready 可选的加载状态标记（加载完成后变为true）
          */
-        void addAudio(const wchar_t *filename, float volume = 1.0f, size_t *instanceId = nullptr, yumo::readySign *ready = nullptr);
+        void addAudio(const wchar_t *filename, float volume = 1.0f, yumo::audioInstance *instance = nullptr, yumo::readySign *ready = nullptr);
 
         /**
          * @brief 移除预加载音频对象
@@ -248,44 +263,6 @@ namespace
          * @brief 重置所有播放实例的位置到开头
          */
         void resetAll();
-
-        /**
-         * @brief 设置播放实例音量
-         *
-         * @param instanceId 播放实例ID
-         * @param volume 音量（0.0-1.0）
-         */
-        void setVolume(size_t instanceId, float volume);
-
-        /**
-         * @brief 获取播放实例音量
-         */
-        float getVolume(size_t instanceId) const;
-
-        /**
-         * @brief 停止指定播放实例
-         *
-         * @param instanceId 播放实例ID
-         * @throws yumo::exception 无效ID
-         */
-        void stop(size_t instanceId);
-
-        /**
-         * @brief 恢复指定播放实例
-         *
-         * @param instanceId 播放实例ID
-         * @throws yumo::exception 无效ID
-         */
-        void resume(size_t instanceId);
-
-        /**
-         * @brief 设置指定播放实例的静音状态
-         *
-         * @param instanceId 播放实例ID
-         * @param muted true=静音，false=取消静音
-         * @throws yumo::exception 无效ID
-         */
-        void setMuted(size_t instanceId, bool muted);
 
         /**
          * @brief 移除播放实例
@@ -319,6 +296,9 @@ namespace
         std::vector<std::thread> loadThreads_;
         std::mutex loadThreadsMutex_;
 
+        yumo::PlaybackFinishedCallback finishedCallback_;
+        std::mutex callbackMutex_;
+
         static const size_t BUFFER_COUNT = 2;
 
         static void CALLBACK waveOutCallback(HWAVEOUT hwo, UINT uMsg, DWORD_PTR dwInstance, DWORD_PTR dwParam1, DWORD_PTR dwParam2);
@@ -326,6 +306,9 @@ namespace
         void mixAudioChunk(int16_t *output, size_t chunkSize);
 
         void ensureDeviceOpen();
+
+        // 触发播放完成回调
+        void notifyPlaybackFinished(size_t instanceId);
     };
 
     // 前向声明（内部使用的辅助函数）
@@ -379,8 +362,8 @@ namespace
 
         // 用户的 ready 指针（用 shared_ptr 包装，无删除器）
         auto userReady = ready
-                            ? std::shared_ptr<yumo::readySign>(ready, [](yumo::readySign *) {})
-                            : nullptr;
+                             ? std::shared_ptr<yumo::readySign>(ready, [](yumo::readySign *) {})
+                             : nullptr;
 
         if (ready)
         {
@@ -484,8 +467,7 @@ namespace
             if (userReady)
             {
                 *userReady = true;
-            }
-        });
+            } });
 
         // 存储线程而非 detach，确保在析构时线程会被 join
         {
@@ -509,7 +491,7 @@ namespace
     }
 
     // 添加预加载音频并立即播放
-    size_t AudioPool::addAudio(size_t preloadedId, float volume)
+    yumo::audioInstance AudioPool::addAudio(size_t preloadedId, float volume)
     {
         std::unique_lock<std::mutex> lock(mutex_);
 
@@ -517,7 +499,8 @@ namespace
             throw yumo::exception_ex(yumo::exception::type::InvalidID, L"无效的预加载音频ID");
 
         // 检查加载是否失败
-        if (preloadedAudios_[preloadedId]->loadFailed) {
+        if (preloadedAudios_[preloadedId]->loadFailed)
+        {
             std::wstring errMsg = preloadedAudios_[preloadedId]->errorMsg;
             lock.unlock();
             throw yumo::exception_ex2(
@@ -548,10 +531,16 @@ namespace
             ensureDeviceOpen();
         }
 
-        return instanceId;
+        return yumo::audioInstance(
+            instanceId,
+            playInstances_[instanceId].position,
+            playInstances_[instanceId].volume,
+            playInstances_[instanceId].active,
+            playInstances_[instanceId].stopped,
+            playInstances_[instanceId].muted);
     }
     // 添加音频文件并立即播放（便利接口）
-    void AudioPool::addAudio(const wchar_t *filename, float volume, size_t *instanceId, yumo::readySign *ready)
+    void AudioPool::addAudio(const wchar_t *filename, float volume, yumo::audioInstance *instance, yumo::readySign *ready)
     {
         auto readyInternal = std::make_shared<yumo::readySign>(false);
 
@@ -563,10 +552,10 @@ namespace
         size_t preloadedId = preloadAudio(filename, readyInternal.get());
 
         auto userReady = ready
-                            ? std::shared_ptr<yumo::readySign>(ready, [](yumo::readySign *) {})
-                            : nullptr;
+                             ? std::shared_ptr<yumo::readySign>(ready, [](yumo::readySign *) {})
+                             : nullptr;
 
-        std::thread addThread([this, preloadedId, readyInternal, userReady, instanceId, volume]()
+        std::thread addThread([this, preloadedId, readyInternal, userReady, instance, volume]()
                               {
             if (shuttingDown_)
             {
@@ -608,10 +597,10 @@ namespace
             }
 
             try {
-                size_t id = addAudio(preloadedId, volume);
-                if (instanceId)
+                yumo::audioInstance ai = addAudio(preloadedId, volume);
+                if (instance)
                 {
-                    *instanceId = id;
+                    *instance = ai;
                 }
 
                 {
@@ -624,8 +613,7 @@ namespace
                 if (userReady) *userReady = true;
             } catch (...) {
                 if (userReady) *userReady = true;
-            }
-        });
+            } });
 
         // 存储线程，确保在析构时被 join
         {
@@ -814,6 +802,23 @@ namespace
                         pPool->preloadedAudios_[i].reset();
                     }
                 }
+            }
+
+            // 回收播放完毕的实例
+            std::vector<size_t> finishedInstances;
+            for (const auto &inst : pPool->playInstances_)
+            {
+                if (inst.second.active && inst.second.source && inst.second.position >= inst.second.source->data.size())
+                {
+                    finishedInstances.push_back(inst.first);
+                }
+            }
+            for (size_t instanceId : finishedInstances)
+            {
+                pPool->playInstances_.erase(instanceId);
+                pPool->freeInstanceIds_.push(instanceId);
+                // 触发回调通知用户实例已被回收
+                pPool->notifyPlaybackFinished(instanceId);
             }
         }
 
@@ -1020,61 +1025,6 @@ namespace
         }
     }
 
-    // 设置播放实例音量
-    void AudioPool::setVolume(size_t instanceId, float volume)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = playInstances_.find(instanceId);
-        if (it == playInstances_.end())
-            throw yumo::exception_ex(yumo::exception::type::InvalidID, L"无效的播放实例ID");
-
-        it->second.volume = std::max(0.0f, std::min(1.0f, volume));
-    }
-
-    // 获取播放实例音量
-    float AudioPool::getVolume(size_t instanceId) const
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = playInstances_.find(instanceId);
-        if (it == playInstances_.end())
-            throw yumo::exception_ex(yumo::exception::type::InvalidID, L"无效的播放实例ID");
-
-        return it->second.volume;
-    }
-
-    // 停止指定播放实例
-    void AudioPool::stop(size_t instanceId)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = playInstances_.find(instanceId);
-        if (it == playInstances_.end())
-            throw yumo::exception_ex(yumo::exception::type::InvalidID, L"无效的播放实例ID");
-
-        it->second.stopped = true;
-    }
-
-    // 恢复指定播放实例
-    void AudioPool::resume(size_t instanceId)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = playInstances_.find(instanceId);
-        if (it == playInstances_.end())
-            throw yumo::exception_ex(yumo::exception::type::InvalidID, L"无效的播放实例ID");
-
-        it->second.stopped = false;
-    }
-
-    // 设置指定播放实例的静音状态
-    void AudioPool::setMuted(size_t instanceId, bool muted)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = playInstances_.find(instanceId);
-        if (it == playInstances_.end())
-            throw yumo::exception_ex(yumo::exception::type::InvalidID, L"无效的播放实例ID");
-
-        it->second.muted = muted;
-    }
-
     // 移除播放实例
     void AudioPool::remove(size_t instanceId)
     {
@@ -1087,13 +1037,57 @@ namespace
         freeInstanceIds_.push(instanceId);
     }
 
+    // 通过实例ID重新获取播放实例
+    yumo::audioInstance AudioPool::regain(size_t instanceId)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = playInstances_.find(instanceId);
+        if (it == playInstances_.end())
+            return yumo::audioInstance(); // 返回无效实例（instanceId为0）
+
+        auto &inst = it->second;
+        return yumo::audioInstance(
+            instanceId,
+            inst.position,
+            inst.volume,
+            inst.active,
+            inst.stopped,
+            inst.muted);
+    }
+
+    // 注册播放完成回调
+    void AudioPool::registerPlaybackFinishedCallback(yumo::PlaybackFinishedCallback callback)
+    {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        finishedCallback_ = callback;
+    }
+
+    // 注销播放完成回调
+    void AudioPool::unregisterPlaybackFinishedCallback()
+    {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        finishedCallback_ = nullptr;
+    }
+
+    // 触发播放完成回调
+    void AudioPool::notifyPlaybackFinished(size_t instanceId)
+    {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        if (finishedCallback_)
+        {
+            finishedCallback_(instanceId);
+        }
+    }
+
     // MP3格式检测
     // 先通过文件扩展名快速判断（大小写不敏感）
     static bool HasMp3Extension(const wchar_t *filename)
     {
-        if (!filename) return false;
+        if (!filename)
+            return false;
         const wchar_t *dot = wcsrchr(filename, L'.');
-        if (!dot) return false;
+        if (!dot)
+            return false;
         return _wcsicmp(dot, L".mp3") == 0;
     }
 
@@ -1272,7 +1266,7 @@ namespace
         // 打开 ACM 流进行 MP3 → PCM 解码
         HACMSTREAM hStream = NULL;
         MMRESULT mmr = acmStreamOpen(&hStream, NULL, &srcFmt.wfx, &dstFmt, NULL, 0, 0, 0);
-        
+
         if (mmr != MMSYSERR_NOERROR)
         {
             std::wstring msg = L"解码失败: " + MmErrorToString(mmr);
@@ -1285,7 +1279,7 @@ namespace
         {
             acmStreamClose(hStream, 0);
             throw yumo::exception_ex2(yumo::exception::type::DecodeError,
-                L"解码失败: " + MmErrorToString(mmr));
+                                      L"解码失败: " + MmErrorToString(mmr));
         }
 
         std::vector<uint8_t> dstBuffer(dstSize);
@@ -1301,7 +1295,7 @@ namespace
         {
             acmStreamClose(hStream, 0);
             throw yumo::exception_ex2(yumo::exception::type::DecodeError,
-                L"解码失败: " + MmErrorToString(mmr));
+                                      L"解码失败: " + MmErrorToString(mmr));
         }
 
         // acmStreamPrepareHeader 可能修改缓冲区指针和长度，需重新设置
@@ -1313,7 +1307,7 @@ namespace
             acmStreamUnprepareHeader(hStream, &header, 0);
             acmStreamClose(hStream, 0);
             throw yumo::exception_ex2(yumo::exception::type::DecodeError,
-                L"解码失败: " + MmErrorToString(mmr));
+                                      L"解码失败: " + MmErrorToString(mmr));
         }
 
         acmStreamUnprepareHeader(hStream, &header, 0);
@@ -1358,7 +1352,7 @@ namespace
             {
                 acmStreamClose(hResample, 0);
                 throw yumo::exception_ex2(yumo::exception::type::DecodeError,
-                    L"解码失败: " + MmErrorToString(rmmr));
+                                          L"解码失败: " + MmErrorToString(rmmr));
             }
 
             std::vector<uint8_t> resampleBuffer(resampleDstSize);
@@ -1374,7 +1368,7 @@ namespace
             {
                 acmStreamClose(hResample, 0);
                 throw yumo::exception_ex2(yumo::exception::type::DecodeError,
-                    L"解码失败: " + MmErrorToString(rmmr));
+                                          L"解码失败: " + MmErrorToString(rmmr));
             }
 
             rsHeader.cbSrcLength = static_cast<DWORD>(decodedBytes);
@@ -1385,7 +1379,7 @@ namespace
                 acmStreamUnprepareHeader(hResample, &rsHeader, 0);
                 acmStreamClose(hResample, 0);
                 throw yumo::exception_ex2(yumo::exception::type::DecodeError,
-                    L"解码失败: " + MmErrorToString(rmmr));
+                                          L"解码失败: " + MmErrorToString(rmmr));
             }
 
             acmStreamUnprepareHeader(hResample, &rsHeader, 0);
@@ -1652,7 +1646,7 @@ namespace
         if (mmResult != MMSYSERR_NOERROR)
         {
             throw yumo::exception_ex2(yumo::exception::type::DecodeError,
-                L"解码失败: " + MmErrorToString(mmResult));
+                                      L"解码失败: " + MmErrorToString(mmResult));
         }
 
         // 步骤4：计算目标缓冲区大小
@@ -1663,7 +1657,7 @@ namespace
         {
             acmStreamClose(hAcmStream, 0);
             throw yumo::exception_ex2(yumo::exception::type::DecodeError,
-                L"解码失败: " + MmErrorToString(mmResult));
+                                      L"解码失败: " + MmErrorToString(mmResult));
         }
 
         // 步骤5：准备转换头
@@ -1682,7 +1676,7 @@ namespace
         {
             acmStreamClose(hAcmStream, 0);
             throw yumo::exception_ex2(yumo::exception::type::DecodeError,
-                L"解码失败: " + MmErrorToString(mmResult));
+                                      L"解码失败: " + MmErrorToString(mmResult));
         }
 
         // 步骤6：复制源数据
@@ -1697,7 +1691,7 @@ namespace
             acmStreamUnprepareHeader(hAcmStream, &streamHeader, 0);
             acmStreamClose(hAcmStream, 0);
             throw yumo::exception_ex2(yumo::exception::type::DecodeError,
-                L"解码失败: " + MmErrorToString(mmResult));
+                                      L"解码失败: " + MmErrorToString(mmResult));
         }
 
         // 步骤8：清理ACM资源
@@ -1706,14 +1700,14 @@ namespace
         {
             acmStreamClose(hAcmStream, 0);
             throw yumo::exception_ex2(yumo::exception::type::DecodeError,
-                L"解码失败: " + MmErrorToString(mmResult));
+                                      L"解码失败: " + MmErrorToString(mmResult));
         }
 
         mmResult = acmStreamClose(hAcmStream, 0);
         if (mmResult != MMSYSERR_NOERROR)
         {
             throw yumo::exception_ex2(yumo::exception::type::DecodeError,
-                L"解码失败: " + MmErrorToString(mmResult));
+                                      L"解码失败: " + MmErrorToString(mmResult));
         }
 
         // 步骤9：将转换后的数据转换为 StandardWavInfo (int16_t 双声道交织)
@@ -1734,14 +1728,29 @@ namespace yumo
         return AudioPool::getInstance().preloadAudio(filename, ready);
     }
 
-    size_t addAudio(size_t preloadedId, float volume)
+    audioInstance addAudio(size_t preloadedId, float volume)
     {
         return AudioPool::getInstance().addAudio(preloadedId, volume);
     }
 
-    void addAudio(const wchar_t *filename, float volume, size_t *instanceId, readySign *ready)
+    audioInstance regain(size_t instanceId)
     {
-        AudioPool::getInstance().addAudio(filename, volume, instanceId, ready);
+        return AudioPool::getInstance().regain(instanceId);
+    }
+
+    void registerPlaybackFinishedCallback(PlaybackFinishedCallback callback)
+    {
+        AudioPool::getInstance().registerPlaybackFinishedCallback(callback);
+    }
+
+    void unregisterPlaybackFinishedCallback()
+    {
+        AudioPool::getInstance().unregisterPlaybackFinishedCallback();
+    }
+
+    void addAudio(const wchar_t *filename, float volume, audioInstance *instance, readySign *ready)
+    {
+        AudioPool::getInstance().addAudio(filename, volume, instance, ready);
     }
 
     void removePreloadedAudio(size_t preloadedId)
@@ -1767,31 +1776,6 @@ namespace yumo
     void resetAll()
     {
         AudioPool::getInstance().resetAll();
-    }
-
-    void setVolume(size_t instanceId, float volume)
-    {
-        AudioPool::getInstance().setVolume(instanceId, volume);
-    }
-
-    float getVolume(size_t instanceId)
-    {
-        return AudioPool::getInstance().getVolume(instanceId);
-    }
-
-    void stop(size_t instanceId)
-    {
-        AudioPool::getInstance().stop(instanceId);
-    }
-
-    void resume(size_t instanceId)
-    {
-        AudioPool::getInstance().resume(instanceId);
-    }
-
-    void setMuted(size_t instanceId, bool muted)
-    {
-        AudioPool::getInstance().setMuted(instanceId, muted);
     }
 
     void remove(size_t instanceId)

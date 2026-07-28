@@ -49,12 +49,12 @@ int main()
 
         // 同时播放三段音频
         std::wcout << L"\n=== 开始播放 ===" << std::endl;
-        size_t inst1 = yumo::addAudio(id1);
-        size_t inst2 = yumo::addAudio(id2);
-        size_t inst3 = yumo::addAudio(id3);
+        yumo::audioInstance inst1 = yumo::addAudio(id1);
+        yumo::audioInstance inst2 = yumo::addAudio(id2);
+        yumo::audioInstance inst3 = yumo::addAudio(id3);
         yumo::global.mute = false; // 取消静音开始播放
 
-        std::wcout << L"播放实例ID: " << inst1 << L", " << inst2 << L", " << inst3 << std::endl;
+        std::wcout << L"播放实例已创建" << std::endl;
         std::wcout << L"播放实例数: " << yumo::getPlayingCount() << std::endl;
 
         // 播放5秒
