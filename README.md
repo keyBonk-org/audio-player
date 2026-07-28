@@ -1,5 +1,7 @@
 # Yumo Audio
 
+[学习如何使用yumo audio](https://keybonk-org.github.io/docs/audio-player/usage/)
+
 Yumo Audio是利用WIN32 API实现的C++音频播放库，主要聚焦于音频混合等基础API无法满足的功能，属于自用型库，完全服务于[keyBonk](https://github.com/xiaoditx/keyBonk)所以有一些通用功能将不予考虑
 
 由于上文提到的自用特性，本库结构异常混乱，不支持CMake构建，部分文件缺失需要手动补齐，因此暂不建议直接使用。如果必须使用，请自行改造本库。
