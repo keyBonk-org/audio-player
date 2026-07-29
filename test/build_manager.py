@@ -66,6 +66,8 @@ def parse_selection(input_str):
             else:
                 print(f"警告: 无效范围格式 '{part}'，跳过")
         elif part.isdigit():
+            if (part == "9"):
+                print("\n\033[1;6;94mBaka!")
             # 单个数字
             selected.add(int(part))
         else:
@@ -178,4 +180,5 @@ def main():
 if __name__ == "__main__":
     while True:
         os.system('cls')
+        print("\033[0m")
         main()
