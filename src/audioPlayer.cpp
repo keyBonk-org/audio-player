@@ -416,7 +416,8 @@ namespace
 
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    if (preloadedId < preloadedAudios_.size())
+                    if (preloadedId < preloadedAudios_.size() &&
+                        preloadedAudios_[preloadedId]) // 检查指针有效性，防止在加载过程中被移除
                     {
                         preloadedAudios_[preloadedId]->data = std::move(standardData);
                     }
@@ -425,7 +426,7 @@ namespace
                 if (!shuttingDown_)
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    if (preloadedId < preloadedAudios_.size())
+                    if (preloadedId < preloadedAudios_.size() && preloadedAudios_[preloadedId])
                     {
                         preloadedAudios_[preloadedId]->loadFailed = true;
                         preloadedAudios_[preloadedId]->errorMsg = e.what();
@@ -435,7 +436,7 @@ namespace
                 if (!shuttingDown_)
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    if (preloadedId < preloadedAudios_.size())
+                    if (preloadedId < preloadedAudios_.size() && preloadedAudios_[preloadedId])
                     {
                         preloadedAudios_[preloadedId]->loadFailed = true;
                         preloadedAudios_[preloadedId]->errorMsg = e.what();
@@ -445,7 +446,7 @@ namespace
                 if (!shuttingDown_)
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    if (preloadedId < preloadedAudios_.size())
+                    if (preloadedId < preloadedAudios_.size() && preloadedAudios_[preloadedId])
                     {
                         preloadedAudios_[preloadedId]->loadFailed = true;
                         preloadedAudios_[preloadedId]->errorMsg = L"加载失败";
@@ -455,7 +456,7 @@ namespace
                 if (!shuttingDown_)
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    if (preloadedId < preloadedAudios_.size())
+                    if (preloadedId < preloadedAudios_.size() && preloadedAudios_[preloadedId])
                     {
                         preloadedAudios_[preloadedId]->loadFailed = true;
                         preloadedAudios_[preloadedId]->errorMsg = L"未知错误";
@@ -497,6 +498,9 @@ namespace
 
         if (preloadedId >= preloadedAudios_.size())
             throw yumo::exception_ex(yumo::exception::type::InvalidID, L"无效的预加载音频ID");
+
+        if (!preloadedAudios_[preloadedId])
+            throw yumo::exception_ex(yumo::exception::type::InvalidID, L"预加载音频已被移除");
 
         // 检查加载是否失败
         if (preloadedAudios_[preloadedId]->loadFailed)
@@ -584,10 +588,11 @@ namespace
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (preloadedId >= preloadedAudios_.size() || 
+                    !preloadedAudios_[preloadedId] ||
                     preloadedAudios_[preloadedId]->data.empty() ||
                     preloadedAudios_[preloadedId]->loadFailed)
                 {
-                    if (preloadedId < preloadedAudios_.size())
+                    if (preloadedId < preloadedAudios_.size() && preloadedAudios_[preloadedId])
                     {
                         preloadedAudios_[preloadedId]->markedForRemoval = true;
                     }
@@ -605,7 +610,7 @@ namespace
 
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    if (preloadedId < preloadedAudios_.size())
+                    if (preloadedId < preloadedAudios_.size() && preloadedAudios_[preloadedId])
                     {
                         preloadedAudios_[preloadedId]->markedForRemoval = true;
                     }
@@ -627,7 +632,7 @@ namespace
     {
         std::lock_guard<std::mutex> lock(mutex_);
 
-        if (preloadedId >= preloadedAudios_.size())
+        if (preloadedId >= preloadedAudios_.size() || !preloadedAudios_[preloadedId])
         {
             throw yumo::exception_ex(yumo::exception::type::InvalidID, L"无效的预加载音频ID");
         }
