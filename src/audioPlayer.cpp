@@ -520,7 +520,7 @@ namespace
         PlayInstance instance;
         instance.source = preloadedAudios_[preloadedId].get();
         instance.position = 0;
-        instance.volume = volume;
+        instance.volume = std::clamp(volume, 0.0f, 1.0f);
         instance.active = true;
         instance.stopped = false;
         instance.muted = false;
@@ -664,7 +664,10 @@ namespace
     size_t AudioPool::getPreloadedCount() const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        return preloadedAudios_.size();
+        return (size_t)std::count_if(
+            preloadedAudios_.begin(),
+            preloadedAudios_.end(),
+            [](const std::unique_ptr<PreloadedAudio> &audio) { return !!audio; });
     }
 
     // 获取当前播放实例数量
