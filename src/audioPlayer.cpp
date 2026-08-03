@@ -178,9 +178,9 @@ namespace
      */
     struct AudioBuffer
     {
-        std::vector<int16_t> data;    // PCM 缓冲区数据（动态大小，支持后期调整）
-        WAVEHDR header{};             // waveOut 头部
-        bool prepared = false;        // header 是否已 prepare
+        std::vector<int16_t> data; // PCM 缓冲区数据（动态大小，支持后期调整）
+        WAVEHDR header{};          // waveOut 头部
+        bool prepared = false;     // header 是否已 prepare
     };
 
     /**
@@ -320,10 +320,10 @@ namespace
 
         // 缓冲区回收线程，避免在waveOut回调中调用waveOutWrite等wave系列函数
         // （MSDN 明确禁止在回调中调用wave函数，可能会导致死锁）
-        HANDLE bufferEvent_ = nullptr;  // auto-reset 事件，回调通过 SetEvent 唤醒 worker
-        std::thread bufferWorker_;      // 缓冲区回收线程
+        HANDLE bufferEvent_ = nullptr; // auto-reset 事件，回调通过 SetEvent 唤醒 worker
+        std::thread bufferWorker_;     // 缓冲区回收线程
 
-        void bufferWorkerLoop();        // worker线程主循环：回收done缓冲区
+        void bufferWorkerLoop(); // worker线程主循环：回收done缓冲区
 
         void mixAudioChunk(int16_t *output, size_t chunkSize);
 
@@ -709,7 +709,8 @@ namespace
         return (size_t)std::count_if(
             preloadedAudios_.begin(),
             preloadedAudios_.end(),
-            [](const std::unique_ptr<PreloadedAudio> &audio) { return !!audio; });
+            [](const std::unique_ptr<PreloadedAudio> &audio)
+            { return !!audio; });
     }
 
     // 获取当前播放实例数量
@@ -796,14 +797,14 @@ namespace
 
     /**
      * 缓冲区回收 worker 线程主循环
-     * 
+     *
      * 等待回调通知（SetEvent），然后对已完成的缓冲区执行：
      *   1. 清理已完成的播放实例/预加载对象
      *   2. mixAudioChunk 填充新数据
      *   3. waveOutWrite 重新提交
-     * 
+     *
      * 所有 wave 系列函数调用都在此线程中完成，绝不在回调中调用。
-    */
+     */
     void AudioPool::bufferWorkerLoop()
     {
         while (true)
@@ -929,14 +930,14 @@ namespace
         // 设备已打开且正在播放，无需操作
         if (hWaveOut_ && isPlaying_)
             return;
-        
+
         // 创建事件（若未创建）
         if (!bufferEvent_)
         {
             bufferEvent_ = CreateEvent(nullptr, FALSE, FALSE, nullptr); // 自动重置
             if (!bufferEvent_)
                 throw yumo::exception_ex2(yumo::exception::type::UnknownError,
-                                        L"创建事件失败");
+                                          L"创建事件失败");
         }
 
         // 设备已打开但空闲（之前的音频播放完毕或提交失败），重启播放
@@ -996,13 +997,13 @@ namespace
             &hWaveOut,
             WAVE_MAPPER,
             &wf,
-            (DWORD_PTR)bufferEvent_,   // 事件句柄
-            0,                         // 实例数据（忽略）
-            CALLBACK_EVENT);           // 关键标志
+            (DWORD_PTR)bufferEvent_, // 事件句柄
+            0,                       // 实例数据（忽略）
+            CALLBACK_EVENT);         // 关键标志
 
         if (mmr != MMSYSERR_NOERROR)
             throw yumo::exception_ex2(yumo::exception::type::PlaybackError,
-                                    L"播放失败: " + mmErrorToString(mmr));
+                                      L"播放失败: " + mmErrorToString(mmr));
 
         lock.lock();
         if (shuttingDown_)
@@ -1822,7 +1823,7 @@ namespace yumo
         return AudioPool::getInstance().getPlayingCount();
     }
 
-    bool isPlaying(size_t instanceId)
+    bool audioInstance::isPlaying() const
     {
         return AudioPool::getInstance().isPlaying(instanceId);
     }
