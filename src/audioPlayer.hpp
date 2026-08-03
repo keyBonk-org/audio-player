@@ -1,3 +1,13 @@
+/**
+ * @file        audioPlayer.hpp
+ * @brief       本文件是Yumo Audio库的头文件， 提供音频播放相关的类和函数声明。
+ * 通过引入该头文件，可以使用Yumo Audio库进行音频文件的预加载、播放、控制音量、
+ * 静音、停止等操作。
+ * @details     暂无
+ * @author      xiaoditx <552333302@qq.com>
+ * @version     0.2.0
+ * @copyright   开源，遵循 WTFPL 协议
+ */
 #ifndef AUDIO_PLAYER_HPP
 #define AUDIO_PLAYER_HPP
 #include <atomic>
@@ -8,10 +18,10 @@
 namespace yumo
 {
     /**
-     * @brief 原子类型封装类
-     * 用于封装 std::atomic，提供更方便的操作接口
-     * 支持隐式转换、赋值、比较等操作
-     * 内部使用 std::atomic，保证线程安全
+     * @brief 原子类型封装类。
+     * 用于封装 std::atomic，提供更方便的操作接口；
+     * 支持隐式转换、赋值、比较等操作；
+     * 内部使用 std::atomic，保证线程安全。
      *
      * @tparam T 原子类型
      */
@@ -25,7 +35,7 @@ namespace yumo
         // 构造函数
         atomic() = default;
         atomic(T val) : value_(val) {}
-        // 拷贝构造（手动实现）
+        // 拷贝构造
         atomic(const atomic &other) : value_(other.load()) {}
         // 拷贝赋值
         atomic &operator=(const atomic &other)
@@ -41,13 +51,13 @@ namespace yumo
             return *this;
         }
 
-        // 隐式转换为 T（内存序 seq_cst）
+        // 隐式转换为T
         operator T() const
         {
             return value_.load(std::memory_order_seq_cst);
         }
 
-        // 与 T 的比较（原有，内存序改为 seq_cst）
+        // 与 T 的比较
         bool operator==(T other) const
         {
             return value_.load(std::memory_order_seq_cst) == other;
@@ -58,12 +68,11 @@ namespace yumo
             return value_.load(std::memory_order_seq_cst) != other;
         }
 
-        // load / store（默认内存序 seq_cst）
+        // 支持 load / store 以便一些模板使用（虽然不是很推荐在库外使用这个类）
         T load(std::memory_order order = std::memory_order_seq_cst) const
         {
             return value_.load(order);
         }
-
         void store(T val, std::memory_order order = std::memory_order_seq_cst)
         {
             value_.store(val, order);
@@ -76,46 +85,44 @@ namespace yumo
     {
         return a.load() == b.load();
     }
-
     template <typename T>
     bool operator!=(const atomic<T> &a, const atomic<T> &b)
     {
         return a.load() != b.load();
     }
-
     // yumo::atomic 与 std::atomic 之间的比较
     template <typename T>
     bool operator==(const atomic<T> &a, const std::atomic<T> &b)
     {
         return a.load() == b.load();
     }
-
     template <typename T>
     bool operator!=(const atomic<T> &a, const std::atomic<T> &b)
     {
         return a.load() != b.load();
     }
-
     template <typename T>
     bool operator==(const std::atomic<T> &a, const atomic<T> &b)
     {
         return a.load() == b.load();
     }
-
     template <typename T>
     bool operator!=(const std::atomic<T> &a, const atomic<T> &b)
     {
         return a.load() != b.load();
     }
 
-    using readySign = atomic<bool>;
-    using switchSign = atomic<bool>;
-    using volumeSign = atomic<float>;
+    // 相关typedef
+    using readySign = atomic<bool>;   // 完成标记
+    using switchSign = atomic<bool>;  // 开关标记
+    using volumeSign = atomic<float>; // 音量标记
 
     /**
-     * @brief 音频控制信号类
+     * @brief 全集音频控制信号类
      *
-     * 用于控制音频状态，支持直接赋值操作
+     * 用于控制全局音频状态，支持直接赋值操作
+     *
+     * todo 将其应用到单个音频上去
      */
     class audioSign
     {
@@ -125,6 +132,14 @@ namespace yumo
         volumeSign volume{1.0f}; // 音量（0.0-1.0）
     };
 
+    /**
+     * @brief 播放实例类
+     *
+     * 用于表示一个音频播放实例，包含播放位置、音量、激活状态、停止状态和静音状态等信息。
+     * 通过该类可以控制和查询音频播放实例的状态。
+     *
+     * todo 提供一个成员记录时长
+     */
     class audioInstance
     {
     public:
@@ -159,11 +174,12 @@ namespace yumo
             friend class audioInstance;
         };
         const size_t instanceId; // 播放实例ID（按值传递）
-        proxy<size_t> position;  // 播放位置（采样点）
-        proxy<float> volume;     // 音量（0.0-1.0）
-        proxy<bool> active;      // 是否激活播放
-        proxy<bool> stopped;     // 是否停止（挂起）
-        proxy<bool> muted;       // 是否静音（跳过混音但位置继续推进）
+        // todo 改成秒为单位方便用户使用
+        proxy<size_t> position; // 播放位置（采样点）
+        proxy<float> volume;    // 音量（0.0-1.0）
+        proxy<bool> active;     // 是否激活播放
+        proxy<bool> stopped;    // 是否停止（挂起）
+        proxy<bool> muted;      // 是否静音（跳过混音但位置继续推进）
         audioInstance() : instanceId(0), position(), volume(), active(), stopped(), muted() {}
         audioInstance(size_t id, size_t &pos, float &vol, bool &active, bool &stop, bool &mute)
             : instanceId(id), position(pos), volume(vol), active(active), stopped(stop), muted(mute) {}
