@@ -158,22 +158,24 @@ namespace yumo
             }
             friend class audioInstance;
         };
-        const size_t instanceId;        // 播放实例ID（按值传递）
-        proxy<size_t> position;   // 播放位置（采样点）
-        proxy<float> volume;      // 音量（0.0-1.0）
-        proxy<bool> active;       // 是否激活播放
-        proxy<bool> stopped;      // 是否停止（挂起）
-        proxy<bool> muted;        // 是否静音（跳过混音但位置继续推进）
+        const size_t instanceId; // 播放实例ID（按值传递）
+        proxy<size_t> position;  // 播放位置（采样点）
+        proxy<float> volume;     // 音量（0.0-1.0）
+        proxy<bool> active;      // 是否激活播放
+        proxy<bool> stopped;     // 是否停止（挂起）
+        proxy<bool> muted;       // 是否静音（跳过混音但位置继续推进）
         audioInstance() : instanceId(0), position(), volume(), active(), stopped(), muted() {}
         audioInstance(size_t id, size_t &pos, float &vol, bool &active, bool &stop, bool &mute)
             : instanceId(id), position(pos), volume(vol), active(active), stopped(stop), muted(mute) {}
-        audioInstance(const audioInstance &other) 
+        audioInstance(const audioInstance &other)
             : instanceId(other.instanceId), position(other.position), volume(other.volume), active(other.active), stopped(other.stopped), muted(other.muted) {}
         // 用户层面上说，proxy = proxy 操作像是一个变量值赋到另一个变量（other隐式转换后触发self赋值操作）
         // instance = instance 操作像是一个播放实例赋值另一个播放实例，也就是proxy所有权的转移
         // 因此不给proxy重载赋值运算符，避免用户误以为是赋值操作
-        audioInstance &operator=(const audioInstance &other) {
-            if (this == &other) return *this;
+        audioInstance &operator=(const audioInstance &other)
+        {
+            if (this == &other)
+                return *this;
             const_cast<size_t &>(instanceId) = other.instanceId;
             position.ptr_ = other.position.ptr_;
             position.mutex_ = other.position.mutex_;
@@ -187,13 +189,14 @@ namespace yumo
             muted.mutex_ = other.muted.mutex_;
             return *this;
         }
+        bool isPlaying() const;
     };
 
     /**
      * @brief 播放完成回调类型
-     * 
+     *
      * 当播放实例被自动回收时调用，通知用户该实例已失效
-     * 
+     *
      * @param instanceId 被回收的播放实例ID
      */
     using PlaybackFinishedCallback = std::function<void(size_t instanceId)>;
@@ -224,18 +227,18 @@ namespace yumo
     audioInstance addAudio(size_t preloadedId, float volume = 1.0f);
     /**
      * @brief 通过实例ID重新获取播放实例
-     * 
+     *
      * 如果实例已被回收或不存在，返回无效的audioInstance（instanceId为0）
-     * 
+     *
      * @param[in] instanceId 播放实例ID
      * @return 播放实例，如果无效则instanceId为0
      */
     audioInstance regain(size_t instanceId);
     /**
      * @brief 注册播放完成回调
-     * 
+     *
      * 当播放实例被自动回收时调用此回调
-     * 
+     *
      * @param[in] callback 回调函数，参数为被回收的实例ID
      */
     void registerPlaybackFinishedCallback(PlaybackFinishedCallback callback);
@@ -274,14 +277,6 @@ namespace yumo
      * @return 正在播放的音频数量
      */
     size_t getPlayingCount();
-    /**
-     * @brief 检查指定播放实例是否正在播放
-     *
-     * @param[in] instanceId 播放实例ID
-     * @return 如果正在播放返回true，否则返回false
-     * @throws yumo::exception 无效的播放实例ID
-     */
-    bool isPlaying(size_t instanceId);
     /**
      * @brief 重置所有播放实例的位置到开头
      */
