@@ -167,6 +167,22 @@ namespace
         bool muted;             // 是否静音（跳过混音但位置继续推进）
     };
 
+    // 音频缓冲区大小（约100ms的音频）
+    // 计算：采样率 * 声道数 * 时长(秒) = 44100 * 2 * 0.1 = 8820 个样本
+    const size_t AUDIO_CHUNK_SIZE = static_cast<size_t>(44100 * 2 * 0.1);
+
+    /**
+     * @brief 预分配的音频缓冲区
+     *
+     * data 使用 std::vector 而非定长数组，以支持后期运行时调整缓冲区大小：
+     */
+    struct AudioBuffer
+    {
+        std::vector<int16_t> data;    // PCM 缓冲区数据（动态大小，支持后期调整）
+        WAVEHDR header{};             // waveOut 头部
+        bool prepared = false;        // header 是否已 prepare
+    };
+
     /**
      * @brief 音频池类 - 单例模式
      *
@@ -299,7 +315,15 @@ namespace
 
         static const size_t BUFFER_COUNT = 2;
 
-        static void CALLBACK waveOutCallback(HWAVEOUT hwo, UINT uMsg, DWORD_PTR dwInstance, DWORD_PTR dwParam1, DWORD_PTR dwParam2);
+        std::vector<std::unique_ptr<AudioBuffer>> buffers_;
+        size_t chunkSize_ = AUDIO_CHUNK_SIZE; // 当前缓冲区大小（样本数），后期可运行时调整
+
+        // 缓冲区回收线程，避免在waveOut回调中调用waveOutWrite等wave系列函数
+        // （MSDN 明确禁止在回调中调用wave函数，可能会导致死锁）
+        HANDLE bufferEvent_ = nullptr;  // auto-reset 事件，回调通过 SetEvent 唤醒 worker
+        std::thread bufferWorker_;      // 缓冲区回收线程
+
+        void bufferWorkerLoop();        // worker线程主循环：回收done缓冲区
 
         void mixAudioChunk(int16_t *output, size_t chunkSize);
 
@@ -314,24 +338,44 @@ namespace
     void loadWav(const wchar_t *filename, WavInfo *out);
     StandardWavInfo loadAudio(const wchar_t *filename);
 
-    // 音频缓冲区大小（约100ms的音频）
-    // 计算：采样率 * 声道数 * 时长(秒) = 44100 * 2 * 0.1 = 8820 个样本
-    const size_t AUDIO_CHUNK_SIZE = static_cast<size_t>(44100 * 2 * 0.1);
-
     // AudioPool 单例实现
     AudioPool::AudioPool() = default;
 
     AudioPool::~AudioPool()
     {
         shuttingDown_ = true;
+        if (bufferEvent_)
+            SetEvent(bufferEvent_); // 唤醒worker使其检测到shuttingDown_并退出
+        if (bufferWorker_.joinable())
+            bufferWorker_.join();
 
-        // 等待所有加载线程完成（先关设备，再等线程）
         // 关闭音频设备（先重置再关闭，确保所有缓冲区被正确返回）
+        // waveOutReset会同步返回所有在途缓冲区并触发WOM_DONE回调
         if (hWaveOut_)
         {
             waveOutReset(hWaveOut_);
+
+            // 在关闭设备前 unprepare 所有预分配缓冲区
+            // （waveOutUnprepareHeader 需要有效的设备句柄，必须在 waveOutClose 之前完成）
+            for (auto &buf : buffers_)
+            {
+                if (buf && buf->prepared)
+                {
+                    waveOutUnprepareHeader(hWaveOut_, &buf->header, sizeof(WAVEHDR));
+                    buf->prepared = false;
+                }
+            }
+            buffers_.clear();
+
             waveOutClose(hWaveOut_);
             hWaveOut_ = nullptr;
+        }
+
+        // 关闭事件句柄（waveOutReset后不再有回调，可安全关闭）
+        if (bufferEvent_)
+        {
+            CloseHandle(bufferEvent_);
+            bufferEvent_ = nullptr;
         }
 
         // 等待所有加载线程完成
@@ -750,130 +794,124 @@ namespace
         }
     }
 
-    // 音频播放回调
-    void CALLBACK AudioPool::waveOutCallback(HWAVEOUT hwo, UINT uMsg, DWORD_PTR dwInstance, DWORD_PTR dwParam1, [[maybe_unused]] DWORD_PTR dwParam2)
+    /**
+     * 缓冲区回收 worker 线程主循环
+     * 
+     * 等待回调通知（SetEvent），然后对已完成的缓冲区执行：
+     *   1. 清理已完成的播放实例/预加载对象
+     *   2. mixAudioChunk 填充新数据
+     *   3. waveOutWrite 重新提交
+     * 
+     * 所有 wave 系列函数调用都在此线程中完成，绝不在回调中调用。
+    */
+    void AudioPool::bufferWorkerLoop()
     {
-        if (uMsg != WOM_DONE)
-            return;
-
-        WAVEHDR *pHeader = reinterpret_cast<WAVEHDR *>(dwParam1);
-        AudioPool *pPool = reinterpret_cast<AudioPool *>(dwInstance);
-
-        if (!pPool || !pHeader)
-            return;
-
-        // 先释放已播放完的缓冲区（总是安全的，即使设备已关闭）
-        waveOutUnprepareHeader(hwo, pHeader, sizeof(WAVEHDR));
-        delete[] pHeader->lpData;
-        delete pHeader;
-
-        // 如果正在关闭，不再提交新的缓冲区
-        if (pPool->shuttingDown_)
-            return;
-
-        // 检查是否所有音频都播放完毕
-        bool allFinished = true;
+        while (true)
         {
-            std::lock_guard<std::mutex> lock(pPool->mutex_);
-            if (!pPool->isPlaying_ || pPool->shuttingDown_)
+            // 等待回调通知有缓冲区完成（或析构函数唤醒以退出）
+            WaitForSingleObject(bufferEvent_, INFINITE);
+
+            if (shuttingDown_)
+                break;
+
+            // 收集所有已完成的缓冲区
+            std::vector<AudioBuffer *> doneBuffers;
             {
-                return; // 已停止或正在关闭
-            }
-            // 如果有激活的实例还没播完，就继续
-            for (const auto &inst : pPool->playInstances_)
-            {
-                if (inst.second.active && inst.second.source && inst.second.position < inst.second.source->data.size())
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!isPlaying_ || shuttingDown_)
                 {
-                    allFinished = false;
-                    break;
+                    if (shuttingDown_)
+                        break;
+                    continue; // 设备未在播放，等待下次信号
+                }
+                for (auto &buf : buffers_)
+                {
+                    if (buf && (buf->header.dwFlags & WHDR_DONE))
+                        doneBuffers.push_back(buf.get());
                 }
             }
 
-            // 清理标记为待删除且没有被引用的预加载对象
-            for (size_t i = 0; i < pPool->preloadedAudios_.size(); ++i)
+            // 逐个回收已完成的缓冲区
+            for (AudioBuffer *pBuf : doneBuffers)
             {
-                if (pPool->preloadedAudios_[i] && pPool->preloadedAudios_[i]->markedForRemoval)
+                if (shuttingDown_)
+                    break;
+
+                try
                 {
-                    bool isReferenced = false;
-                    for (const auto &inst : pPool->playInstances_)
+                    // 跳过已被其他路径（如 ensureDeviceOpen 重启）重新提交的缓冲区
+                    if (pBuf->header.dwFlags & WHDR_INQUEUE)
+                        continue;
+
+                    // 清理已完成的实例 / 预加载对象
                     {
-                        if (inst.second.active && inst.second.source == pPool->preloadedAudios_[i].get())
-                        {
-                            isReferenced = true;
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        if (!isPlaying_ || shuttingDown_)
                             break;
+
+                        // 清理标记为待删除且没有被引用的预加载对象
+                        for (size_t i = 0; i < preloadedAudios_.size(); ++i)
+                        {
+                            if (preloadedAudios_[i] && preloadedAudios_[i]->markedForRemoval)
+                            {
+                                bool isReferenced = false;
+                                for (const auto &inst : playInstances_)
+                                {
+                                    if (inst.second.active && inst.second.source == preloadedAudios_[i].get())
+                                    {
+                                        isReferenced = true;
+                                        break;
+                                    }
+                                }
+                                if (!isReferenced)
+                                    preloadedAudios_[i].reset();
+                            }
+                        }
+
+                        // 回收播放完毕的实例
+                        std::vector<size_t> finishedInstances;
+                        for (const auto &inst : playInstances_)
+                        {
+                            if (inst.second.active && inst.second.source && inst.second.position >= inst.second.source->data.size())
+                                finishedInstances.push_back(inst.first);
+                        }
+                        for (size_t instanceId : finishedInstances)
+                        {
+                            playInstances_.erase(instanceId);
+                            freeInstanceIds_.push(instanceId);
+                            notifyPlaybackFinished(instanceId);
                         }
                     }
-                    if (!isReferenced)
+
+                    // 所有音频播放完毕时保持设备播放静音（避免设备空闲后重启问题）
+                    // mixAudioChunk 内部加锁，此处不持锁以免死锁
+                    mixAudioChunk(pBuf->data.data(), pBuf->data.size());
+
+                    if (shuttingDown_)
+                        break;
+
+                    // 重新提交缓冲区（header 已 prepared，可反复 waveOutWrite）
+                    MMRESULT writeResult = waveOutWrite(hWaveOut_, &pBuf->header, sizeof(WAVEHDR));
+                    if (writeResult != WAVERR_STILLPLAYING && writeResult != MMSYSERR_NOERROR)
                     {
-                        pPool->preloadedAudios_[i].reset();
+                        // 提交失败，标记设备为非播放状态，等待 ensureDeviceOpen 重启
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        isPlaying_ = false;
+                    }
+                }
+                catch (...)
+                {
+                    // 绝不让异常中断 worker 线程
+                    try
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        isPlaying_ = false;
+                    }
+                    catch (...)
+                    {
                     }
                 }
             }
-
-            // 回收播放完毕的实例
-            std::vector<size_t> finishedInstances;
-            for (const auto &inst : pPool->playInstances_)
-            {
-                if (inst.second.active && inst.second.source && inst.second.position >= inst.second.source->data.size())
-                {
-                    finishedInstances.push_back(inst.first);
-                }
-            }
-            for (size_t instanceId : finishedInstances)
-            {
-                pPool->playInstances_.erase(instanceId);
-                pPool->freeInstanceIds_.push(instanceId);
-                // 触发回调通知用户实例已被回收
-                pPool->notifyPlaybackFinished(instanceId);
-            }
-        }
-
-        if (allFinished)
-        {
-            // 所有音频播放完毕，但保持设备播放静音，避免设备进入空闲状态
-            // 设备空闲后重启播放会导致问题，因此用静音缓冲区保持设备活跃
-            // isPlaying_ 保持为 true，回调继续提交静音缓冲区
-        }
-
-        // 如果正在关闭，不再提交新的缓冲区
-        if (pPool->shuttingDown_)
-            return;
-
-        // 准备新的数据
-        int16_t *pData = new int16_t[AUDIO_CHUNK_SIZE];
-        pPool->mixAudioChunk(pData, AUDIO_CHUNK_SIZE);
-
-        // 再次检查是否在关闭期间
-        if (pPool->shuttingDown_)
-        {
-            delete[] pData;
-            return;
-        }
-
-        WAVEHDR *pNewHeader = new WAVEHDR;
-        memset(pNewHeader, 0, sizeof(WAVEHDR));
-        pNewHeader->lpData = reinterpret_cast<LPSTR>(pData);
-        pNewHeader->dwBufferLength = static_cast<DWORD>(AUDIO_CHUNK_SIZE * sizeof(int16_t));
-
-        MMRESULT prepResult = waveOutPrepareHeader(hwo, pNewHeader, sizeof(WAVEHDR));
-        if (prepResult != MMSYSERR_NOERROR)
-        {
-            delete[] pData;
-            delete pNewHeader;
-            std::lock_guard<std::mutex> lock(pPool->mutex_);
-            pPool->isPlaying_ = false;
-            return;
-        }
-
-        MMRESULT writeResult = waveOutWrite(hwo, pNewHeader, sizeof(WAVEHDR));
-        if (writeResult != MMSYSERR_NOERROR)
-        {
-            waveOutUnprepareHeader(hwo, pNewHeader, sizeof(WAVEHDR));
-            delete[] pData;
-            delete pNewHeader;
-            std::lock_guard<std::mutex> lock(pPool->mutex_);
-            pPool->isPlaying_ = false;
-            return;
         }
     }
 
@@ -891,40 +929,36 @@ namespace
         // 设备已打开且正在播放，无需操作
         if (hWaveOut_ && isPlaying_)
             return;
+        
+        // 创建事件（若未创建）
+        if (!bufferEvent_)
+        {
+            bufferEvent_ = CreateEvent(nullptr, FALSE, FALSE, nullptr); // 自动重置
+            if (!bufferEvent_)
+                throw yumo::exception_ex2(yumo::exception::type::UnknownError,
+                                        L"创建事件失败");
+        }
 
-        // 设备已打开但空闲（之前的音频播放完毕），重启播放
+        // 设备已打开但空闲（之前的音频播放完毕或提交失败），重启播放
         if (hWaveOut_ && !isPlaying_)
         {
             isPlaying_ = true;
             lock.unlock();
 
-            // 提交初始缓冲区重启播放
-            for (size_t i = 0; i < BUFFER_COUNT; ++i)
+            // 使用预分配缓冲区重启播放
+            for (size_t i = 0; i < buffers_.size(); ++i)
             {
-                int16_t *pData = new int16_t[AUDIO_CHUNK_SIZE];
-                mixAudioChunk(pData, AUDIO_CHUNK_SIZE);
+                // 跳过仍在设备队列中的缓冲区（重启窗口期内可能尚未返回）
+                if (buffers_[i]->header.dwFlags & WHDR_INQUEUE)
+                    continue;
 
-                WAVEHDR *pHeader = new WAVEHDR;
-                memset(pHeader, 0, sizeof(WAVEHDR));
-                pHeader->lpData = reinterpret_cast<LPSTR>(pData);
-                pHeader->dwBufferLength = static_cast<DWORD>(AUDIO_CHUNK_SIZE * sizeof(int16_t));
+                mixAudioChunk(buffers_[i]->data.data(), buffers_[i]->data.size());
 
-                MMRESULT prepResult = waveOutPrepareHeader(hWaveOut_, pHeader, sizeof(WAVEHDR));
-                if (prepResult != MMSYSERR_NOERROR)
-                {
-                    delete[] pData;
-                    delete pHeader;
-                    throw yumo::exception_ex2(
-                        yumo::exception::type::PlaybackError,
-                        L"播放失败: " + mmErrorToString(prepResult));
-                }
-
-                MMRESULT writeResult = waveOutWrite(hWaveOut_, pHeader, sizeof(WAVEHDR));
+                MMRESULT writeResult = waveOutWrite(hWaveOut_, &buffers_[i]->header, sizeof(WAVEHDR));
+                if (writeResult == WAVERR_STILLPLAYING)
+                    continue; // 已被 worker 线程提交，跳过
                 if (writeResult != MMSYSERR_NOERROR)
                 {
-                    waveOutUnprepareHeader(hWaveOut_, pHeader, sizeof(WAVEHDR));
-                    delete[] pData;
-                    delete pHeader;
                     throw yumo::exception_ex2(
                         yumo::exception::type::PlaybackError,
                         L"播放失败: " + mmErrorToString(writeResult));
@@ -957,19 +991,18 @@ namespace
 
         lock.unlock();
 
-        if (shuttingDown_)
-            return;
+        // 使用事件回调
+        MMRESULT mmr = waveOutOpen(
+            &hWaveOut,
+            WAVE_MAPPER,
+            &wf,
+            (DWORD_PTR)bufferEvent_,   // 事件句柄
+            0,                         // 实例数据（忽略）
+            CALLBACK_EVENT);           // 关键标志
 
-        MMRESULT mmResult = waveOutOpen(&hWaveOut, WAVE_MAPPER, &wf,
-                                        reinterpret_cast<DWORD_PTR>(waveOutCallback),
-                                        reinterpret_cast<DWORD_PTR>(this), CALLBACK_FUNCTION);
-
-        if (mmResult != MMSYSERR_NOERROR)
-        {
-            throw yumo::exception_ex2(
-                yumo::exception::type::PlaybackError,
-                L"播放失败: " + mmErrorToString(mmResult));
-        }
+        if (mmr != MMSYSERR_NOERROR)
+            throw yumo::exception_ex2(yumo::exception::type::PlaybackError,
+                                    L"播放失败: " + mmErrorToString(mmr));
 
         lock.lock();
         if (shuttingDown_)
@@ -980,45 +1013,60 @@ namespace
         if (hWaveOut_)
         {
             waveOutClose(hWaveOut);
-            lock.unlock();
+            // lock.unlock();
             return;
         }
         hWaveOut_ = hWaveOut;
         isPlaying_ = true;
         lock.unlock();
 
-        // 预先准备多个缓冲区（双缓冲）
+        // 预分配缓冲区池（双缓冲）
+        buffers_.clear();
+        buffers_.reserve(BUFFER_COUNT);
         for (size_t i = 0; i < BUFFER_COUNT; ++i)
         {
-            int16_t *pData = new int16_t[AUDIO_CHUNK_SIZE];
-            mixAudioChunk(pData, AUDIO_CHUNK_SIZE);
+            if (shuttingDown_)
+                break;
 
-            WAVEHDR *pHeader = new WAVEHDR;
-            memset(pHeader, 0, sizeof(WAVEHDR));
-            pHeader->lpData = reinterpret_cast<LPSTR>(pData);
-            pHeader->dwBufferLength = static_cast<DWORD>(AUDIO_CHUNK_SIZE * sizeof(int16_t));
+            auto buf = std::make_unique<AudioBuffer>();
+            buf->data.resize(chunkSize_, 0); // 预分配数据缓冲区并清零
 
-            MMRESULT prepResult = waveOutPrepareHeader(hWaveOut, pHeader, sizeof(WAVEHDR));
+            WAVEHDR &hdr = buf->header;
+            memset(&hdr, 0, sizeof(WAVEHDR));
+            hdr.lpData = reinterpret_cast<LPSTR>(buf->data.data());
+            hdr.dwBufferLength = static_cast<DWORD>(buf->data.size() * sizeof(int16_t));
+            // todo 不再用于回调，可以移除？
+            hdr.dwUser = reinterpret_cast<DWORD_PTR>(buf.get());
+
+            MMRESULT prepResult = waveOutPrepareHeader(hWaveOut, &hdr, sizeof(WAVEHDR));
             if (prepResult != MMSYSERR_NOERROR)
             {
-                delete[] pData;
-                delete pHeader;
                 throw yumo::exception_ex2(
                     yumo::exception::type::PlaybackError,
                     L"播放失败: " + mmErrorToString(prepResult));
             }
+            buf->prepared = true;
 
-            MMRESULT writeResult = waveOutWrite(hWaveOut, pHeader, sizeof(WAVEHDR));
+            // 填充初始数据并提交（回调可能在此后立即触发，需确保 buf 生命周期延续）
+            mixAudioChunk(buf->data.data(), buf->data.size());
+
+            MMRESULT writeResult = waveOutWrite(hWaveOut, &hdr, sizeof(WAVEHDR));
             if (writeResult != MMSYSERR_NOERROR)
             {
-                waveOutUnprepareHeader(hWaveOut, pHeader, sizeof(WAVEHDR));
-                delete[] pData;
-                delete pHeader;
+                waveOutUnprepareHeader(hWaveOut, &hdr, sizeof(WAVEHDR));
+                buf->prepared = false;
                 throw yumo::exception_ex2(
                     yumo::exception::type::PlaybackError,
                     L"播放失败: " + mmErrorToString(writeResult));
             }
+
+            // unique_ptr 转移到 buffers_，AudioBuffer 对象地址不变，dwUser 指针保持有效
+            buffers_.push_back(std::move(buf));
         }
+
+        // 启动缓冲区回收 worker 线程（在所有初始缓冲区提交后启动，避免与分配过程竞争 buffers_）
+        if (!bufferWorker_.joinable())
+            bufferWorker_ = std::thread(&AudioPool::bufferWorkerLoop, this);
     }
 
     // 重置所有播放实例的位置到开头
@@ -1789,3 +1837,26 @@ namespace yumo
         AudioPool::getInstance().remove(instanceId);
     }
 }
+
+/*
+                   _ooOoo_
+                  o8888888o
+                  88" . "88
+                  (| -_- |)
+                  O\  =  /O
+               ____/`---'\____
+             .'  \\|     |//  `.
+            /  \\|||  :  |||//  \
+           /  _||||| -:- |||||-  \
+           |   | \\\  -  /// |   |
+           | \_|  ''\---/''  |   |
+           \  .-\__  `-`  ___/-. /
+         ___`. .'  /--.--\  `. . __
+      ."" '<  `.___\_<|>_/___.'  >'"".
+     | | :  `- \`.;`\ _ /`;.`/ - ` : | |
+     \  \ `-.   \_ __\ /__ _/   .-` /  /
+======`-.____`-.___\_____/___.-`____.-'======
+                   `=---='
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+            佛祖保佑       永无BUG
+*/
