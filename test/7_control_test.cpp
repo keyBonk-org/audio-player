@@ -121,6 +121,27 @@ int main()
             }
             std::wcout << L"  音频 " << (i + 1) << L" 预加载完成" << std::endl;
         }
+        
+        std::mutex coutMutex;  // 用于保护 wcout
+        
+        // 注册回调
+        yumo::registerPlaybackFinishedCallback([&audios, &coutMutex](size_t instanceId) {
+            for (size_t i = 0; i < 3; ++i) {
+                if (audios[i].instance.instanceId == instanceId && audios[i].isPlaying) {
+                    // 更新状态
+                    audios[i].isPlaying = false;
+                    audios[i].isPaused = false;
+
+                    // 向用户显示播放完成信息（加锁保护）
+                    {
+                        std::lock_guard<std::mutex> lock(coutMutex);
+                        std::wcout << L"\n[系统] 音频 " << (i + 1) << L" 播放完成" << std::endl;
+                        std::wcout << L"\n请输入选择：";
+                    }
+                    break;
+                }
+            }
+        });
 
         int choice;
         do
