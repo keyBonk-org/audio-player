@@ -844,43 +844,51 @@ namespace
                     if (pBuf->header.dwFlags & WHDR_INQUEUE)
                         continue;
 
-                    // 清理已完成的实例 / 预加载对象
                     {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        if (!isPlaying_ || shuttingDown_)
-                            break;
-
-                        // 清理标记为待删除且没有被引用的预加载对象
-                        for (size_t i = 0; i < preloadedAudios_.size(); ++i)
+                        // 用于存放被清理对象 id 的数组
+                        std::vector<size_t> finishedInstances;
+                        // 带锁清理已完成的实例 / 预加载对象
                         {
-                            if (preloadedAudios_[i] && preloadedAudios_[i]->markedForRemoval)
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            if (!isPlaying_ || shuttingDown_)
+                                break;
+
+                            // 清理标记为待删除且没有被引用的预加载对象
+                            for (size_t i = 0; i < preloadedAudios_.size(); ++i)
                             {
-                                bool isReferenced = false;
-                                for (const auto &inst : playInstances_)
+                                if (preloadedAudios_[i] && preloadedAudios_[i]->markedForRemoval)
                                 {
-                                    if (inst.second.active && inst.second.source == preloadedAudios_[i].get())
+                                    bool isReferenced = false;
+                                    for (const auto &inst : playInstances_)
                                     {
-                                        isReferenced = true;
-                                        break;
+                                        if (inst.second.active && inst.second.source == preloadedAudios_[i].get())
+                                        {
+                                            isReferenced = true;
+                                            break;
+                                        }
                                     }
+                                    if (!isReferenced)
+                                        preloadedAudios_[i].reset();
                                 }
-                                if (!isReferenced)
-                                    preloadedAudios_[i].reset();
+                            }
+
+                            // 回收播放完毕的实例
+                            for (const auto &inst : playInstances_)
+                            {
+                                if (inst.second.active && inst.second.source && inst.second.position >= inst.second.source->data.size())
+                                    finishedInstances.push_back(inst.first);
+                            }
+                            for (size_t instanceId : finishedInstances)
+                            {
+                                playInstances_.erase(instanceId);
+                                freeInstanceIds_.push(instanceId);
                             }
                         }
-
-                        // 回收播放完毕的实例
-                        std::vector<size_t> finishedInstances;
-                        for (const auto &inst : playInstances_)
+                        // 在锁外通知用户注册的播放完成回调
+                        // 防止用户在回调中调用带锁的库函数造成死锁
+                        for (size_t freeId : finishedInstances)
                         {
-                            if (inst.second.active && inst.second.source && inst.second.position >= inst.second.source->data.size())
-                                finishedInstances.push_back(inst.first);
-                        }
-                        for (size_t instanceId : finishedInstances)
-                        {
-                            playInstances_.erase(instanceId);
-                            freeInstanceIds_.push(instanceId);
-                            notifyPlaybackFinished(instanceId);
+                            notifyPlaybackFinished(freeId);
                         }
                     }
 
